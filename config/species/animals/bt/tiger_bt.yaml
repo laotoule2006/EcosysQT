@@ -1,0 +1,78 @@
+schema_version: 1
+BehaviorTreeDef:
+  defName: Tiger
+  root:
+    type: PrioritySelector
+    children:
+      # ========== 逃跑（高优先级） ==========
+      - type: TickIntervalDecorator  # 每帧评估，确保快速逃离
+        name: Flee
+        interval: 1
+        child:
+          type: Sequence
+          children:
+            - type: Condition
+              cond: should_flee
+            - type: Action
+              action: flee_from_threat
+              status_name: "Fleeing"
+
+      # ========== 交配（雄性） ==========
+      - type: Sequence  # 条件满足后：决策节流 + 执行每帧
+        name: Mate
+        children:
+          - type: Condition
+            cond: sex_is_male
+          - type: Condition
+            cond: can_reproduce
+          - type: Condition
+            cond: desire_below_param
+            probability_param: mating_desire_probability
+          - type: TickIntervalDecorator  # 每60tick搜索配偶（昂贵决策）
+            name: FindMate
+            interval: 60
+            child:
+              type: Action
+              action: find_available_mate
+          - type: Action
+            action: approach_or_mate    # 每帧靠近/交配，保证移动平滑
+            mating_range_param: mating_range
+
+      # ========== 捕食（牛） - [已修正] ==========
+      - type: Sequence  # 条件满足后：目标选择节流 + 追逐每帧
+        name: Hunt
+        children:
+          - type: Condition
+            cond: is_hungry
+          - type: PrioritySelector
+            children:
+              - type: Action
+                action: hunt_target_race
+                kind: cow
+                range_param: hunting_range
+                success_rate_param: hunting_success_rate
+                status_name: "Hunting"
+              - type: Sequence
+                children:
+                  - type: TickIntervalDecorator  # 每30tick选择一次猎物目标；不执行移动
+                    name: SelectTarget
+                    interval: 30
+                    child:
+                      type: Action
+                      action: select_target_point
+                      status_name: "Scanning Prey"
+                  - type: Action
+                    action: plan_path_to_target  # 每帧追逐至目标
+                    range_param: hunting_range
+                    status_name: "Chasing Prey"
+
+      # ========== 游荡 ==========
+      - type: TickIntervalDecorator  # 每帧评估游荡；轻量检查
+        name: Wander
+        interval: 0
+        child:
+          type: Action
+          action: wander_anywhere      # 随机游荡；受半径与持续时间参数控制
+          status_name: "Wandering"
+          radius_param: wander_radius
+          duration_param: wandering_duration

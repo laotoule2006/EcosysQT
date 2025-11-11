@@ -121,6 +121,8 @@ static void apply_yaml_fields_by_name(const YAML::Node& node, T& params) {
         try {
             if constexpr (std::is_same_v<Member, int>) {
                 (params.*ptr) = node[name].as<int>();
+            } else if constexpr (std::is_same_v<Member, bool>) {
+                (params.*ptr) = node[name].as<bool>();
             } else if constexpr (std::is_same_v<Member, double>) {
                 (params.*ptr) = node[name].as<double>();
             } else if constexpr (std::is_same_v<Member, std::vector<std::string>>) {
@@ -163,6 +165,9 @@ static void load_params_recursive(const std::string& name, T& params, const std:
 
     if constexpr (std::is_base_of_v<AnimalParams, T>) {
         apply_yaml_fields_by_name(node["animal"], params);
+        // 解析 bt_params（按层覆盖）
+        parse_bt_params_node(node["species"], params);
+        parse_bt_params_node(node["animal"], params);
     }
     if constexpr (std::is_base_of_v<PlantParams, T>) {
         apply_yaml_fields_by_name(node["plant"], params);
@@ -170,6 +175,9 @@ static void load_params_recursive(const std::string& name, T& params, const std:
     }
 
     apply_yaml_fields_by_name(node[name], params);
+    if constexpr (std::is_base_of_v<AnimalParams, T>) {
+        parse_bt_params_node(node[name], params);
+    }
     SPDLOG_LOGGER_DEBUG(spdlog::get("ecosim"), "[Config] Applied overrides for '{}'", name);
 }
 
@@ -185,25 +193,151 @@ template <> inline void postprocess_params<AnimalParams>(AnimalParams& params) {
     clamp(params.hunting_success_rate, 0.0, 1.0);
     if (params.movement_speed < 0.0) params.movement_speed = 0.0;
     if (params.energy_consumption < 0) params.energy_consumption = 0;
+    // 饥饿伤害与间隔比例、营养值
+    if (params.starvation_damage < 0.0) params.starvation_damage = 0.0;
+    clamp(params.starvation_damage_interval_ratio, 0.0, 1.0);
+    if (params.nutrition_value < 0.0) params.nutrition_value = 0.0;
+    //ENERGY加成参数：
+    if (params.nutrition_bonus_max < 0.0) params.nutrition_bonus_max = 0.0;
+    if (params.nutrition_bonus_curve_alpha < 0.0) params.nutrition_bonus_curve_alpha = 0.0;
+    // 生命恢复：基础恢复量
+    if (params.hp_regen_base_per_day < 0.0) params.hp_regen_base_per_day = 0.0;
+    // 生命恢复：状态倍数
+    if (params.hp_regen_mul_satisfied < 0.0) params.hp_regen_mul_satisfied = 0.0;
+    if (params.hp_regen_mul_normal < 0.0) params.hp_regen_mul_normal = 0.0;
+    if (params.hp_regen_mul_starving < 0.0) params.hp_regen_mul_starving = 0.0;
+    // 生命恢复：触发间隔比例
+    clamp(params.regan_interval_ratio, 0.0, 1.0);
+}
+
+template <> inline void postprocess_params<PlantParams>(PlantParams& params) {
+    // 植物营养值非负
+    if (params.nutrition_value < 0.0) params.nutrition_value = 0.0;
 }
 
 YamlSpeciesConfigProvider::YamlSpeciesConfigProvider(std::string config_root_dir)
     : root_dir(std::move(config_root_dir)) {}
 
 AnimalParams YamlSpeciesConfigProvider::get_animal_params(const std::string& name) const {
+    // 先尝试命中缓存
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        auto it = animal_cache.find(name);
+        if (it != animal_cache.end()) {
+            SPDLOG_LOGGER_DEBUG(spdlog::get("ecosim"), "[Config] Animal params cache hit for '{}'", name);
+            return it->second;
+        }
+    }
+
     AnimalParams params{}; // 使用结构体自身默认作为最终兜底
     load_params_recursive<AnimalParams>(name, params, root_dir);
     postprocess_params(params);
+
+    // 写入缓存（双检）
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        auto [it, inserted] = animal_cache.emplace(name, params);
+        if (!inserted) {
+            // 竞争条件下可能已有值，保持已有值即可
+            SPDLOG_LOGGER_DEBUG(spdlog::get("ecosim"), "[Config] Animal params cache already populated for '{}'", name);
+        } else {
+            SPDLOG_LOGGER_DEBUG(spdlog::get("ecosim"), "[Config] Animal params cached for '{}'", name);
+        }
+    }
     return params;
 }
 
 PlantParams YamlSpeciesConfigProvider::get_plant_params(const std::string& name) const {
+    // 先尝试命中缓存
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        auto it = plant_cache.find(name);
+        if (it != plant_cache.end()) {
+            SPDLOG_LOGGER_DEBUG(spdlog::get("ecosim"), "[Config] Plant params cache hit for '{}'", name);
+            return it->second;
+        }
+    }
+
     PlantParams params{};
     load_params_recursive<PlantParams>(name, params, root_dir);
     postprocess_params(params);
+
+    // 写入缓存（双检）
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        auto [it, inserted] = plant_cache.emplace(name, params);
+        if (!inserted) {
+            SPDLOG_LOGGER_DEBUG(spdlog::get("ecosim"), "[Config] Plant params cache already populated for '{}'", name);
+        } else {
+            SPDLOG_LOGGER_DEBUG(spdlog::get("ecosim"), "[Config] Plant params cached for '{}'", name);
+        }
+    }
     return params;
 }
 
 std::string YamlSpeciesConfigProvider::get_config_root_dir() const {
     return root_dir;
+}
+// 解析行为树黑板参数 bt_params 并写入 AnimalParams 的字典
+static void parse_bt_params_node(const YAML::Node& node, AnimalParams& params) {
+    if (!node) return;
+    const YAML::Node bp = node["bt_params"];
+    if (!bp) return;
+
+    auto try_assign_scalar = [&](const std::string& key, const YAML::Node& v) {
+        try { params.bt_params_ints[key] = v.as<int>(); return; } catch (...) {}
+        try { params.bt_params_doubles[key] = v.as<double>(); return; } catch (...) {}
+        try { params.bt_params_strings[key] = v.as<std::string>(); return; } catch (...) {}
+    };
+
+    std::function<void(const YAML::Node&, const std::string&)> parse_any_map = [&](const YAML::Node& m, const std::string& prefix){
+        if (!m || !m.IsMap()) return;
+        for (auto it : m) {
+            const std::string k = it.first.as<std::string>();
+            const YAML::Node v = it.second;
+            const std::string full_key = prefix.empty() ? k : (prefix + "." + k);
+            if (v.IsMap()) {
+                parse_any_map(v, full_key);
+            } else if (v.IsSequence()) {
+                try_assign_scalar(full_key, v);
+            } else {
+                try_assign_scalar(full_key, v);
+            }
+        }
+    };
+
+    if (bp.IsMap()) {
+        const YAML::Node ints = bp["ints"];
+        const YAML::Node doubles = bp["doubles"];
+        const YAML::Node strings = bp["strings"];
+        if (ints && ints.IsMap()) {
+            for (auto it : ints) {
+                const std::string k = it.first.as<std::string>();
+                try { params.bt_params_ints[k] = it.second.as<int>(); } catch (...) {}
+            }
+        }
+        if (doubles && doubles.IsMap()) {
+            for (auto it : doubles) {
+                const std::string k = it.first.as<std::string>();
+                try { params.bt_params_doubles[k] = it.second.as<double>(); } catch (...) {}
+            }
+        }
+        if (strings && strings.IsMap()) {
+            for (auto it : strings) {
+                const std::string k = it.first.as<std::string>();
+                try { params.bt_params_strings[k] = it.second.as<std::string>(); } catch (...) {}
+            }
+        }
+
+        for (auto it : bp) {
+            const std::string k = it.first.as<std::string>();
+            if (k == "ints" || k == "doubles" || k == "strings") continue;
+            const YAML::Node v = it.second;
+            if (v.IsMap()) {
+                parse_any_map(v, k);
+            } else {
+                try_assign_scalar(k, v);
+            }
+        }
+    }
 }

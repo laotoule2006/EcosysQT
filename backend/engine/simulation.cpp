@@ -1,7 +1,9 @@
 #include "simulation.h"
 #include "tracy/Tracy.hpp"
+#include "high_resolution_timer.h"
 #include <chrono>
 #include <iostream>
+#include <mutex>
 
 // --- SimulationEngine Implementation ---
 
@@ -11,11 +13,16 @@ SimulationEngine::SimulationEngine(const EcosystemConfig& config)
             thread_pool(std::make_unique<ThreadPool>(0)), // 初始化线程池，0代表自动根据硬件选择合适的线程数
             running(false),
             paused(false),
-            simulation_speed(1.0),
             target_fps(30),
-            stop_event(false) {
+            stop_event(false),
+            // 初始化 TPS 统计成员
+        m_current_tps(0.0),
+        m_tps_frame_counter(0),
+        m_tps_last_update_time(std::chrono::steady_clock::now()) {
     // 创建一个初始快照，确保 GUI 在线程启动前也能安全读取数据。
-    std::atomic_store(&m_visible_data, std::make_shared<EcosystemStateData>(ecosystem->get_ecosystem_state()));
+    auto initial_snapshot = std::make_shared<EcosystemStateData>(ecosystem->get_ecosystem_state());
+    initial_snapshot->current_tps = m_current_tps.load(std::memory_order_relaxed);
+    std::atomic_store(&m_visible_data, initial_snapshot);
 }
 
 SimulationEngine::~SimulationEngine() {
@@ -56,10 +63,14 @@ void SimulationEngine::stop() {
 void SimulationEngine::reset(const EcosystemConfig& new_config) {
     bool was_running = is_running();
     stop();
+    {
+    std::lock_guard<std::mutex> lock(m_ecosystem_mutex);
     config = new_config;
     ecosystem->reset(new_config);
-    // 发布重置后的快照，让前端立即看到初始状态。
-    std::atomic_store(&m_visible_data, std::make_shared<EcosystemStateData>(ecosystem->get_ecosystem_state()));
+    auto new_snapshot = std::make_shared<EcosystemStateData>(ecosystem->get_ecosystem_state());
+    new_snapshot->current_tps = m_current_tps.load(std::memory_order_relaxed);
+    std::atomic_store(&m_visible_data, new_snapshot);
+    }
     if (was_running) {
         start();
     }
@@ -69,30 +80,31 @@ void SimulationEngine::step() {
     if (running) {
         return; // Cannot step while simulation is running automatically
     }
-    update_ecosystem();
-    // 单步模式下也需要发布最新数据。
-    std::atomic_store(&m_visible_data, std::make_shared<EcosystemStateData>(ecosystem->get_ecosystem_state()));
-}
-
-void SimulationEngine::set_speed(double speed) {
-    simulation_speed = std::max(0.1, std::min(5.0, speed));
-}
-
-EcosystemStateData SimulationEngine::get_data() const {
-    // 原子地获取可见快照指针，确保跨线程读取安全。
-    std::shared_ptr<EcosystemStateData> data_ptr = std::atomic_load(&m_visible_data);
-    if (!data_ptr) {
-        return EcosystemStateData{};
+    std::shared_ptr<EcosystemStateData> new_snapshot;
+    {
+        std::lock_guard<std::mutex> lock(m_ecosystem_mutex);
+        update_ecosystem();
+        new_snapshot = std::make_shared<EcosystemStateData>(ecosystem->get_ecosystem_state());
+        new_snapshot->current_tps = m_current_tps.load(std::memory_order_relaxed);
     }
-    return *data_ptr;
+    std::atomic_store(&m_visible_data, new_snapshot);
+}
+
+std::shared_ptr<EcosystemStateData> SimulationEngine::get_data() const {
+    return std::atomic_load(&m_visible_data);
 }
 
 void SimulationEngine::update_config(const EcosystemConfig& new_config) {
+    std::lock_guard<std::mutex> lock(m_ecosystem_mutex);
     config = new_config;
     // Note: This matches Python behavior, only updating the config object.
     // The ecosystem itself is not reset here.
 }
-
+// --- 新增：实现设置目标FPS的函数 ---
+void SimulationEngine::set_target_fps(int fps) {
+    // 限制FPS在合理范围内，例如 1 到 200
+    this->target_fps = std::clamp(fps, 1, 2000);
+}
 bool SimulationEngine::is_running() const {
     return running;
 }
@@ -102,25 +114,58 @@ bool SimulationEngine::is_paused() const {
 }
 
 void SimulationEngine::simulation_loop() {
+    // Raise timer resolution for the duration of the simulation loop on Windows.
+    // This improves precision of short sleeps used for frame pacing.
+    #ifdef _WIN32
+    HighResolutionTimer _hrt(1);
+    #endif
     while (!stop_event) {
+        ZoneScoped;
         const auto frame_start = std::chrono::steady_clock::now();
         if (!paused) {
-            update_ecosystem();
-            // 发布新的模拟帧数据供 GUI 线程读取。
-            auto new_data_snapshot = std::make_shared<EcosystemStateData>(ecosystem->get_ecosystem_state());
-            std::atomic_store(&m_visible_data, new_data_snapshot);
-        }
+            std::shared_ptr<EcosystemStateData> new_snapshot;
+            {
+                ZoneScopedN("Update Frame");
+                std::lock_guard<std::mutex> lock(m_ecosystem_mutex);
 
-        const auto frame_end = std::chrono::steady_clock::now();
-        const auto target_frame_duration = std::chrono::duration<double, std::milli>((1000.0 / target_fps) / simulation_speed);
-        const auto frame_elapsed = std::chrono::duration<double, std::milli>(frame_end - frame_start);
-
-        // Adjust sleep time by subtracting the work duration to keep frame pacing accurate.
-        const auto sleep_duration = target_frame_duration - frame_elapsed;
-        if (sleep_duration.count() > 0.0) {
-            const auto sleep_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(sleep_duration);
-            std::this_thread::sleep_for(sleep_ns);
+                update_ecosystem();
+            }
+            {   
+                ZoneScopedN("Create Snapshot");
+                new_snapshot = std::make_shared<EcosystemStateData>(ecosystem->get_ecosystem_state());
+                new_snapshot->current_tps = m_current_tps.load(std::memory_order_relaxed);
+            }
+            std::atomic_store(&m_visible_data, new_snapshot);
         }
+        {
+            ZoneScopedN("Sleep");
+            const auto frame_end = std::chrono::steady_clock::now();
+            const auto target_frame_duration = std::chrono::duration<double, std::milli>(1000.0 / target_fps);
+            const auto frame_elapsed = std::chrono::duration<double, std::milli>(frame_end - frame_start);
+            // 打印 frame_elapsed 时间，单位是毫秒
+
+            // Adjust sleep time by subtracting the work duration to keep frame pacing accurate.
+            
+            const auto sleep_duration = target_frame_duration - frame_elapsed;
+            if (sleep_duration.count() > 15.6) {
+                const auto sleep_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(sleep_duration);
+                std::this_thread::sleep_for(sleep_ns);
+            }
+        }
+        // TPS 计算逻辑：每秒更新一次当前TPS
+        {
+            ZoneScopedN("TPS Calculation");
+            m_tps_frame_counter++;
+            const auto tps_now = std::chrono::steady_clock::now();
+            const auto tps_elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(tps_now - m_tps_last_update_time).count();
+            if (tps_elapsed_ms >= 1000) {
+                const double tps = static_cast<double>(m_tps_frame_counter) / (static_cast<double>(tps_elapsed_ms) / 1000.0);
+                m_current_tps.store(tps, std::memory_order_relaxed);
+                m_tps_last_update_time = tps_now;
+                m_tps_frame_counter = 0;
+            }
+        }
+        
 
         FrameMark;
     }
@@ -132,9 +177,7 @@ void SimulationEngine::update_ecosystem() {
     // within the C++ EcosystemState methods.
     
     // 1. Update time (tick-based)
-    // 使用目标帧率与模拟速度计算每次更新推进的tick数量（30 ticks/秒 为基线）
-    const double dt_ticks = (30.0 / static_cast<double>(target_fps)) / static_cast<double>(simulation_speed);
-    ecosystem->update_time_ticks(dt_ticks);
+    ecosystem->update_one_tick();
 
     // 2. 分阶段并发更新
     // 使用线程池来并发处理物种的决策和应用阶段，以提高性能。
@@ -241,16 +284,17 @@ void SimulationController::step() {
     engine->step();
 }
 
-void SimulationController::set_speed(double speed) {
-    engine->set_speed(speed);
-}
-
-EcosystemStateData SimulationController::get_data() const {
+std::shared_ptr<EcosystemStateData> SimulationController::get_data() {
     return engine->get_data();
 }
 
 void SimulationController::update_config(const EcosystemConfig& config) {
     engine->update_config(config);
+}
+
+// --- 新增：实现控制器对外的接口 ---
+void SimulationController::set_target_fps(int fps) {
+    engine->set_target_fps(fps);
 }
 
 bool SimulationController::is_running() const {

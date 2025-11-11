@@ -16,32 +16,142 @@
 #include <spdlog/spdlog.h>
 #include <algorithm>
 #include <cmath>
+#include <array>
+#include <queue>
 #include <iterator>
-#include <limits>
 #include <memory>
 #include <stdexcept>
-#include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
+#include <limits>
 #include <utility>
 
 thread_local std::mt19937 EcosystemState::thread_local_rng{std::random_device{}()};
 thread_local std::vector<InteractionRequest>* EcosystemState::tls_active_queue = nullptr;
 
+namespace {
+
+double squared_distance(const Position& a, const Position& b) {
+    const double dx = a.x - b.x;
+    const double dy = a.y - b.y;
+    return (dx * dx) + (dy * dy);
+}
+
+// 曼哈顿距离（L1范数）：两点间距离
+double manhattan_distance(const Position& a, const Position& b) {
+    return std::abs(a.x - b.x) + std::abs(a.y - b.y);
+}
+
+double min_distance_sq_to_rect(const Position& point,
+                               double min_x,
+                               double min_y,
+                               double max_x,
+                               double max_y) {
+    double dx = 0.0;
+    if (point.x < min_x) {
+        dx = min_x - point.x;
+    } else if (point.x > max_x) {
+        dx = point.x - max_x;
+    }
+
+    double dy = 0.0;
+    if (point.y < min_y) {
+        dy = min_y - point.y;
+    } else if (point.y > max_y) {
+        dy = point.y - max_y;
+    }
+
+    return (dx * dx) + (dy * dy);
+}
+
+// 点到矩形的最短曼哈顿距离（L1）：若在范围内则相应维度距离为0
+double min_manhattan_distance_to_rect(const Position& point,
+                                      double min_x,
+                                      double min_y,
+                                      double max_x,
+                                      double max_y) {
+    double dx = 0.0;
+    if (point.x < min_x) {
+        dx = min_x - point.x;
+    } else if (point.x > max_x) {
+        dx = point.x - max_x;
+    }
+
+    double dy = 0.0;
+    if (point.y < min_y) {
+        dy = min_y - point.y;
+    } else if (point.y > max_y) {
+        dy = point.y - max_y;
+    }
+
+    return dx + dy;
+}
+
+double min_distance_sq_to_tile(const Position& point, int tile_x, int tile_y) {
+    const double min_x = static_cast<double>(tile_x);
+    const double min_y = static_cast<double>(tile_y);
+    return min_distance_sq_to_rect(point, min_x, min_y, min_x + 1.0, min_y + 1.0);
+}
+
+double min_distance_sq_to_spatial_cell(const Position& point,
+                                       int cell_x,
+                                       int cell_y,
+                                       double cell_size) {
+    const double min_x = static_cast<double>(cell_x) * cell_size;
+    const double min_y = static_cast<double>(cell_y) * cell_size;
+    return min_distance_sq_to_rect(point, min_x, min_y, min_x + cell_size, min_y + cell_size);
+}
+
+// 点到空间网格单元（cell）的最短曼哈顿距离（L1）
+double min_manhattan_distance_to_spatial_cell(const Position& point,
+                                              int cell_x,
+                                              int cell_y,
+                                              double cell_size) {
+    const double min_x = static_cast<double>(cell_x) * cell_size;
+    const double min_y = static_cast<double>(cell_y) * cell_size;
+    return min_manhattan_distance_to_rect(point, min_x, min_y, min_x + cell_size, min_y + cell_size);
+}
+
+template <typename T>
+struct NearestCandidate {
+    double distance_sq;
+    std::shared_ptr<T> target;
+};
+
+template <typename T>
+struct FarthestFirst {
+    bool operator()(const NearestCandidate<T>& lhs, const NearestCandidate<T>& rhs) const {
+        return lhs.distance_sq < rhs.distance_sq;
+    }
+};
+
+template <typename T>
+struct NearestCandidateRaw {
+    double distance_sq;
+    T* target;
+};
+
+template <typename T>
+struct FarthestFirstRaw {
+    bool operator()(const NearestCandidateRaw<T>& lhs, const NearestCandidateRaw<T>& rhs) const {
+        return lhs.distance_sq < rhs.distance_sq;
+    }
+};
+
+} // namespace
+
 // --- EcosystemState ---
 // 生态系统状态管理器 (模拟核心)
 EcosystemState::EcosystemState(const EcosystemConfig& config)
             : config(config),
-                time_step(0),
-                delta_ticks(1.0),
                 races_registry(config),
                 births(),
                 deaths(),
                 population_history(),
                 spatial_grid(std::make_unique<SpatialGrid>(config.world_width, config.world_height, 100.0)),
-                m_world_grid(static_cast<std::size_t>(std::max(0, config.world_width)) *
-                                         static_cast<std::size_t>(std::max(0, config.world_height))),
-                m_all_things(),
-                thing_reproduction_parents() {
+                m_world_grid(config.world_width, config.world_height),
+                m_all_things() {
+    m_clock.attach_config(&this->config);
     initialize_populations();
 }
 
@@ -50,130 +160,123 @@ EcosystemState::EcosystemState(const EcosystemConfig& config)
 */
 void EcosystemState::initialize_populations() {
     auto logger = spdlog::get("ecosim");
-    const auto expected_size = static_cast<std::size_t>(std::max(0, config.world_width)) *
-                               static_cast<std::size_t>(std::max(0, config.world_height));
-    if (m_world_grid.size() != expected_size) {
-        m_world_grid.assign(expected_size, Tile{});
-    }
-    for (auto& tile : m_world_grid) {
-        tile.things.clear();
-    }
+    m_world_grid.resize(config.world_width, config.world_height);
+    m_world_grid.clear_things();
     m_all_things.clear();
-
-    auto race_names = races_registry.get_all_species_names();
-    if (logger) {
-        logger->info("[Init] Initializing populations for {} races", race_names.size());
-    }
-    for (const auto& name : race_names) {
-        int initial_count = races_registry.get_initial_count(name);
+    m_thing_counts.clear();
+    // 动物初始化块
+    auto init_animals = [&]() {
+        auto race_names = races_registry.get_all_species_names();
         if (logger) {
-            logger->info("[Init] '{}' initial count: {}", name, initial_count);
+            logger->info("[Init] Initializing populations for {} races", race_names.size());
         }
-        for (int i = 0; i < initial_count; ++i) {
-            // 使用 get_thread_local_rng() 保证高质量随机数
-            std::uniform_real_distribution<> distX(0, config.world_width);
-            std::uniform_real_distribution<> distY(0, config.world_height);
-            int x = distX(get_thread_local_rng());
-            int y = distY(get_thread_local_rng());
-            try {
-                // 调用工厂时，传入 get_thread_local_rng()
-                auto new_individual = g_race_factory.create(name, Position{static_cast<double>(x), static_cast<double>(y)}, get_thread_local_rng());
-                races_registry.add_individual(name, std::move(new_individual));
-            } catch (const std::exception& e) {
-                if (logger) {
-                    logger->error("[Init] Failed to create instance for '{}' at index {}: {}", name, i, e.what());
+        for (const auto& name : race_names) {
+            int initial_count = races_registry.get_initial_count(name);
+            if (logger) {
+                logger->info("[Init] '{}' initial count: {}", name, initial_count);
+            }
+            for (int i = 0; i < initial_count; ++i) {
+                std::uniform_real_distribution<> distX(0, config.world_width);
+                std::uniform_real_distribution<> distY(0, config.world_height);
+                int x = distX(get_thread_local_rng());
+                int y = distY(get_thread_local_rng());
+                try {
+                    auto new_individual = g_race_factory.create(name, Position{static_cast<double>(x), static_cast<double>(y)}, get_thread_local_rng());
+                    races_registry.add_individual(name, std::move(new_individual));
+                } catch (const std::exception& e) {
+                    if (logger) {
+                        logger->error("[Init] Failed to create instance for '{}' at index {}: {}", name, i, e.what());
+                    }
+                    throw;
                 }
-                throw; // 上层捕获并报告
             }
         }
-    }
+    };
 
-    auto thing_names = g_thing_factory.get_all_species_names();
-    if (logger) {
-        logger->info("[Init] Initializing things for {} species", thing_names.size());
-    }
+    // 事物初始化块
+    auto init_things = [&]() {
+        auto thing_names = g_thing_factory.get_all_species_names();
+        if (logger) {
+            logger->info("[Init] Initializing things for {} species", thing_names.size());
+        }
+
+        std::mt19937& rng = get_thread_local_rng();
+        std::uniform_int_distribution<int> dist_tile_x(0, config.world_width - 1);
+        std::uniform_int_distribution<int> dist_tile_y(0, config.world_height - 1);
+
+        for (const auto& name : thing_names) {
+            int initial_count = 0;
+            auto it = config.initial_populations.find(name);
+            if (it != config.initial_populations.end()) {
+                initial_count = it->second;
+            }
+            if (logger) {
+                logger->info("[Init] '{}' initial thing count: {}", name, initial_count);
+            }
+
+            int attempts = 0;
+            for (int i = 0; i < initial_count; ++i) {
+                const int kMaxPlacementAttempts = config.max_thing_placement_attempts;
+                bool placed = false;
+                while (!placed && attempts < kMaxPlacementAttempts * initial_count) {
+                    ++attempts;
+                    int tile_x = dist_tile_x(rng);
+                    int tile_y = dist_tile_y(rng);
+                    Tile& tile = m_world_grid.get_tile(tile_x, tile_y);
+                    if (tile.terrain != TerrainType::LAND || !tile.things.empty()) {
+                        continue;
+                    }
+
+                    Position world_pos{static_cast<double>(tile_x) + 0.5, static_cast<double>(tile_y) + 0.5};
+                    auto thing_unique = g_thing_factory.create(name, world_pos, rng);
+                    if (!thing_unique) {
+                        if (logger) {
+                            logger->warn("[Init] Thing factory returned null for '{}'", name);
+                        }
+                        break;
+                    }
+
+                    std::shared_ptr<ThingBase> thing(std::move(thing_unique));
+                    thing->position = world_pos;
+                    thing->m_grid_x = tile_x;
+                    thing->m_grid_y = tile_y;
+                    attach_thing_to_world(thing);
+                    placed = true;
+                }
+
+                if (!placed && logger) {
+                    logger->warn("[Init] Unable to place initial '{}' after {} attempts", name, attempts);
+                }
+            }
+        }
+    };
+
+    // 执行
+    init_animals();
     if (config.world_width <= 0 || config.world_height <= 0) {
         if (logger) {
             logger->warn("[Init] World dimensions are non-positive; skipping thing initialization");
         }
         return;
     }
+    init_things();
+}
 
-    std::mt19937& rng = get_thread_local_rng();
-    std::uniform_int_distribution<int> dist_tile_x(0, config.world_width - 1);
-    std::uniform_int_distribution<int> dist_tile_y(0, config.world_height - 1);
-
-    for (const auto& name : thing_names) {
-        int initial_count = 0;
-        auto it = config.initial_populations.find(name);
-        if (it != config.initial_populations.end()) {
-            initial_count = it->second;
-        }
-        if (logger) {
-            logger->info("[Init] '{}' initial thing count: {}", name, initial_count);
-        }
-
-        int attempts = 0;
-        for (int i = 0; i < initial_count; ++i) {
-            constexpr int kMaxPlacementAttempts = 16;
-            bool placed = false;
-            while (!placed && attempts < kMaxPlacementAttempts * initial_count) {
-                ++attempts;
-                int tile_x = dist_tile_x(rng);
-                int tile_y = dist_tile_y(rng);
-                Tile& tile = get_tile(tile_x, tile_y);
-                if (tile.biome != BiomeType::LAND || !tile.things.empty()) {
-                    continue;
-                }
-
-                Position world_pos{static_cast<double>(tile_x) + 0.5, static_cast<double>(tile_y) + 0.5};
-                auto thing_unique = g_thing_factory.create(name, world_pos, rng);
-                if (!thing_unique) {
-                    if (logger) {
-                        logger->warn("[Init] Thing factory returned null for '{}'", name);
-                    }
-                    break;
-                }
-
-                std::shared_ptr<ThingBase> thing(std::move(thing_unique));
-                thing->position = world_pos;
-                thing->m_grid_x = tile_x;
-                thing->m_grid_y = tile_y;
-                attach_thing_to_world(thing);
-                placed = true;
-            }
-
-            if (!placed && logger) {
-                logger->warn("[Init] Unable to place initial '{}' after {} attempts", name, attempts);
-            }
-        }
+void EcosystemState::attach_thing_to_world(const std::shared_ptr<ThingBase>& thing) {
+    if (!thing) {
+        return;
+    }
+    m_world_grid.add_thing_to_tile(thing.get());
+    m_all_things.push_back(thing);
+    if (thing->alive) {
+        ++m_thing_counts[thing->species_name];
     }
 }
 
-/*
-使用getter函数算出时间
-*/
-int EcosystemState::get_current_day() const {
-    return (time_step / 30000) + 1;
-}
-
-int EcosystemState::get_current_year() const {
-    return ((get_current_day() - 1) / 60) + 1;
-}
-
-int EcosystemState::get_current_quadrum() const {
-    int day_of_year = ((get_current_day() - 1) % 60) + 1;
-    return ((day_of_year - 1) / 15) + 1;
-}
-
-std::string EcosystemState::get_current_quadrum_name() const {
-    static const char* quadrum_names[] = {"Aprimay", "Jugust", "Septober", "Decembery"};
-    int quadrum_index = get_current_quadrum() - 1;
-    if (quadrum_index >= 0 && quadrum_index < 4) {
-        return quadrum_names[quadrum_index];
-    }
-    spdlog::get("ecosim")->warn("get_current_quadrum_name 返回了未知值，请检查时间计算逻辑");
-    return "Unknown"; // 安全保护
+void EcosystemState::detach_thing_from_tile(ThingBase& thing) {
+    m_world_grid.remove_thing_from_tile(thing);
+    thing.m_grid_x = -1;
+    thing.m_grid_y = -1;
 }
 
 /*
@@ -183,13 +286,13 @@ EcosystemStateData EcosystemState::get_ecosystem_state() const {
     EcosystemStateData state;
     state.world_width = config.world_width;
     state.world_height = config.world_height;
-    state.time_step = time_step;
-    state.delta_ticks = delta_ticks;
-    state.current_day = get_current_day();
-    state.current_quadrum = get_current_quadrum();
-    state.current_year = get_current_year();
-    state.current_quadrum_name = get_current_quadrum_name();
-
+    state.time_step = m_clock.time_step();
+    state.current_day = m_clock.current_day();
+    state.current_quadrum = m_clock.current_quadrum();
+    state.current_year = m_clock.current_year();
+    state.current_quadrum_name = m_clock.current_quadrum_name();
+    state.current_hour = m_clock.current_hour();
+    state.current_minute = m_clock.current_minute();
     // 填充 race_lists
     for (const auto& species_name : races_registry.get_all_species_names()) {
         const auto& race_list = races_registry.get_species_list(species_name);
@@ -203,45 +306,51 @@ EcosystemStateData EcosystemState::get_ecosystem_state() const {
         state.race_lists[species_name] = std::move(snapshot);
     }
 
-    for (const auto& thing : m_all_things) {
-        if (!thing) {
-            continue;
+    // --- 优化：使用 m_thing_counts 进行预分配，并仅收集存活对象 ---
+    for (const auto& pair : m_thing_counts) {
+        const std::string& species_name = pair.first;
+        const std::size_t count = pair.second;
+        if (count > 0) {
+            state.thing_lists[species_name].reserve(count);
         }
-        state.thing_lists[thing->species_name].push_back(thing);
+    }
+    for (const auto& thing : m_all_things) {
+        if (thing && thing->alive) {
+            state.thing_lists[thing->species_name].push_back(thing);
+        }
     }
 
     // 预计算草的位置和存活对象 (Eigen矩阵)
-    std::vector<Eigen::Vector2d> alive_grass_positions;
+    // std::vector<Eigen::Vector2d> alive_grass_positions;
 
-    auto grass_it = state.thing_lists.find("grass");
-    if (grass_it != state.thing_lists.end()) {
-        for (const auto& grass : grass_it->second) {
-            if (grass && grass->alive) {
-                state.alive_grass_objects.push_back(grass);
-                alive_grass_positions.emplace_back(grass->position.x, grass->position.y);
-            }
-        }
-    }
+    // auto grass_it = state.thing_lists.find("grass");
+    // if (grass_it != state.thing_lists.end()) {
+    //     for (const auto& grass : grass_it->second) {
+    //         if (grass && grass->alive) {
+    //             state.alive_grass_objects.push_back(grass);
+    //             alive_grass_positions.emplace_back(grass->position.x, grass->position.y);
+    //         }
+    //     }
+    // }
 
-    if (!alive_grass_positions.empty()) {
-        state.grass_positions_array = Eigen::MatrixXd(alive_grass_positions.size(), 2);
-        for (size_t i = 0; i < alive_grass_positions.size(); ++i) {
-            state.grass_positions_array(i, 0) = alive_grass_positions[i](0);
-            state.grass_positions_array(i, 1) = alive_grass_positions[i](1);
-        }
-    } else {
-        state.grass_positions_array = Eigen::MatrixXd(0, 2);
-    }
+    // if (!alive_grass_positions.empty()) {
+    //     state.grass_positions_array = Eigen::MatrixXd(alive_grass_positions.size(), 2);
+    //     for (size_t i = 0; i < alive_grass_positions.size(); ++i) {
+    //         state.grass_positions_array(i, 0) = alive_grass_positions[i](0);
+    //         state.grass_positions_array(i, 1) = alive_grass_positions[i](1);
+    //     }
+    // } else {
+    //     state.grass_positions_array = Eigen::MatrixXd(0, 2);
+    // }
     return state;
 }
 
 /*
 使用统一逻辑更新时间状态
 */
-void EcosystemState::update_time_ticks(double delta_ticks_param) {
-    // --- 时间推进与计算（tick制） ---
-    delta_ticks = delta_ticks_param;
-    time_step++; // 维持离散步计数（整数），与tick小数独立
+void EcosystemState::update_one_tick() {
+    // 离散锁步：每次调用推进一个整数tick
+    m_clock.advance_tick();
 }
 
 /*
@@ -255,56 +364,6 @@ void EcosystemState::update_statistics() {
         population_history.erase(population_history.begin(), population_history.end() - 100);
 }
 
-std::size_t EcosystemState::get_grid_index(int x, int y) const {
-    if (!is_valid_grid_coord(x, y)) {
-        throw std::out_of_range("Grid coordinate out of range");
-    }
-    return static_cast<std::size_t>(y) * static_cast<std::size_t>(config.world_width) + static_cast<std::size_t>(x);
-}
-
-bool EcosystemState::is_valid_grid_coord(int x, int y) const {
-    return x >= 0 && x < config.world_width && y >= 0 && y < config.world_height;
-}
-
-Tile& EcosystemState::get_tile(int x, int y) {
-    if (!is_valid_grid_coord(x, y)) {
-        throw std::out_of_range("Grid coordinate out of range");
-    }
-    return m_world_grid[get_grid_index(x, y)];
-}
-
-const Tile& EcosystemState::get_tile(int x, int y) const {
-    if (!is_valid_grid_coord(x, y)) {
-        throw std::out_of_range("Grid coordinate out of range");
-    }
-    return m_world_grid[get_grid_index(x, y)];
-}
-
-void EcosystemState::attach_thing_to_world(const std::shared_ptr<ThingBase>& thing) {
-    if (!thing) {
-        return;
-    }
-    if (!is_valid_grid_coord(thing->m_grid_x, thing->m_grid_y)) {
-        throw std::out_of_range("Thing grid coordinate out of range");
-    }
-    Tile& tile = get_tile(thing->m_grid_x, thing->m_grid_y);
-    tile.things.push_back(thing.get());
-    m_all_things.push_back(thing);
-}
-
-void EcosystemState::detach_thing_from_tile(ThingBase& thing) {
-    if (!is_valid_grid_coord(thing.m_grid_x, thing.m_grid_y)) {
-        return;
-    }
-    Tile& tile = get_tile(thing.m_grid_x, thing.m_grid_y);
-    auto it = std::remove(tile.things.begin(), tile.things.end(), &thing);
-    if (it != tile.things.end()) {
-        tile.things.erase(it, tile.things.end());
-    }
-    thing.m_grid_x = -1;
-    thing.m_grid_y = -1;
-}
-
 /**
  * @brief 为并发更新周期准备生态系统状态。
  *
@@ -316,14 +375,11 @@ void EcosystemState::detach_thing_from_tile(ThingBase& thing) {
  *    这确保了在决策阶段，所有空间查询（如邻居查找）都使用最新的数据。
  */
 void EcosystemState::prepare_for_update() {
+    // 标记当前阶段为准备阶段
+    current_phase = UpdatePhase::Prepare;
     staged_requests.clear();      // 清空暂存的交互请求
     main_thread_requests.clear(); // 清空主线程处理的请求
-    race_energy_changes.clear();  // 清空能量变化记录
-    race_marked_for_death.clear();     // 清空待移除的生物体列表
-    thing_energy_changes.clear();
-    thing_marked_for_death.clear();
-    reproduction_parents.clear(); // 清空待新生的父代列表
-    thing_reproduction_parents.clear();
+    m_resolution_state.clear();   // 重置上一周期的交互解决结果
 
     if (!spatial_grid) {
         return;
@@ -351,106 +407,113 @@ void EcosystemState::prepare_for_update() {
  * @param pool 用于执行任务的线程池。
  */
 void EcosystemState::dispatch_decision_tasks(ThreadPool& pool) {
-    // 定义每个任务处理的个体数量。选择一个较大的值可以减少任务创建的开销，
-    // 但也可能导致负载不均。1024 是一个在开销和负载均衡之间的合理权衡。
-    constexpr std::size_t chunk_size = 1024;
+    current_phase = UpdatePhase::Decision;
 
-    // 确保 `worker_request_queues` 的大小与线程池的工作线程数一致。
-    // 如果不一致（例如，线程池大小在运行时发生变化），则重新分配队列。
+    constexpr std::size_t heavy_chunk_size = 1;
+    constexpr std::size_t light_chunk_size = 8192;
+
     const std::size_t worker_count = std::max<std::size_t>(1, pool.worker_count());
     if (worker_request_queues.size() != worker_count) {
         worker_request_queues.assign(worker_count, {});
     }
-    // 在新一轮决策开始前，清空所有线程的请求队列。
     for (auto& queue : worker_request_queues) {
         queue.clear();
     }
 
-    // 定义一个 lambda 函数，用于将一部分个体（一个“块”）的决策任务提交到线程池。
-    const auto submit_chunk = [this, &pool](std::vector<std::shared_ptr<RaceBase>>& list,
-                                            std::size_t begin,
-                                            std::size_t end) {
-        // 向线程池提交一个新任务。
-        pool.submit([this, &list, begin, end] {
-            // 获取当前工作线程的索引，以便找到对应的请求队列。
-            const auto worker_index = ThreadPool::current_worker_index();
-            std::vector<InteractionRequest>* active_queue = nullptr;
-            // 确保工作索引在有效范围内，然后获取该线程的请求队列指针。
-            if (worker_index < worker_request_queues.size()) {
-                active_queue = &worker_request_queues[worker_index];
-            }
-
-            // 激活当前线程的请求队列。`submit_interaction_request` 将把请求放入此队列。
-            // `activate_request_queue` 返回先前的队列，以便在任务结束时恢复。
-            auto* previous_queue = activate_request_queue(active_queue);
-            // 遍历分配给该任务的个体。
-            auto& rng = get_thread_local_rng();
-            for (std::size_t i = begin; i < end; ++i) {
-                auto& individual = list[i];
-                if (!individual) {
-                    continue;
-                }
-                individual->decide(*this, rng);
-            }
-            // 任务完成，恢复之前的请求队列。这对于嵌套任务或单线程回退情况很重要。
-            restore_request_queue(previous_queue);
-        });
-    };
-
-    // 为植物(things)定义与动物相同的决策分派逻辑。
-    const auto submit_thing_chunk = [this, &pool](std::vector<std::shared_ptr<ThingBase>>& list,
-                                                  std::size_t begin,
-                                                  std::size_t end) {
-        pool.submit([this, &list, begin, end] {
-            const auto worker_index = ThreadPool::current_worker_index();
-            std::vector<InteractionRequest>* active_queue = nullptr;
-            if (worker_index < worker_request_queues.size()) {
-                active_queue = &worker_request_queues[worker_index];
-            }
-
-            auto* previous_queue = activate_request_queue(active_queue);
-            auto& rng = get_thread_local_rng();
-            for (std::size_t i = begin; i < end; ++i) {
-                auto& individual = list[i];
-                if (!individual) {
-                    continue;
-                }
-                individual->decide(*this, rng);
-            }
-            restore_request_queue(previous_queue);
-        });
-    };
-
-    // 遍历所有已注册的物种，为它们分派决策任务。
+    std::vector<std::shared_ptr<RaceBase>> all_races_to_update;
     const auto species_names = races_registry.get_all_species_names();
+    std::size_t total_races = 0;
+    for (const auto& name : species_names) {
+        total_races += races_registry.get_species_list(name).size();
+    }
+    all_races_to_update.reserve(total_races);
     for (const auto& name : species_names) {
         auto& list = races_registry.get_species_list(name);
-        if (list.empty()) {
-            continue;
+        all_races_to_update.insert(all_races_to_update.end(), list.begin(), list.end());
         }
+    auto races_agg = std::make_shared<std::vector<std::shared_ptr<RaceBase>>>(std::move(all_races_to_update));
 
-        // 如果个体数量小于或等于块大小，则直接提交一个任务。
-        if (list.size() <= chunk_size) {
-            submit_chunk(list, 0, list.size());
-            continue;
-        }
+    std::vector<std::shared_ptr<ThingBase>>& all_things_to_update = m_all_things;
 
-        // 如果个体数量大于块大小，则分块提交任务。
-        for (std::size_t begin = 0; begin < list.size(); begin += chunk_size) {
-            const std::size_t end = std::min(begin + chunk_size, list.size());
-            submit_chunk(list, begin, end);
+    std::vector<std::function<void()>> master_task_list;
+    master_task_list.reserve(
+        (races_agg->size() / heavy_chunk_size) +
+        (all_things_to_update.size() / light_chunk_size) + 2
+    );
+
+    if (!races_agg->empty()) {
+        for (std::size_t begin = 0; begin < races_agg->size(); begin += heavy_chunk_size) {
+            const std::size_t end = std::min(begin + heavy_chunk_size, races_agg->size());
+            master_task_list.push_back([this, races_agg, begin, end] {
+                const auto worker_index = ThreadPool::current_worker_index();
+                std::vector<InteractionRequest>* active_queue = nullptr;
+                if (worker_index < worker_request_queues.size()) {
+                    active_queue = &worker_request_queues[worker_index];
+                }
+                auto* previous_queue = activate_request_queue(active_queue);
+                auto& rng = get_thread_local_rng();
+
+                for (std::size_t i = begin; i < end; ++i) {
+                    auto& individual = (*races_agg)[i];
+                    if (individual) {
+                        individual->decide(*this, rng);
+                    }
+                }
+
+                restore_request_queue(previous_queue);
+            });
         }
     }
 
-    if (!m_all_things.empty()) {
-        if (m_all_things.size() <= chunk_size) {
-            submit_thing_chunk(m_all_things, 0, m_all_things.size());
-        } else {
-            for (std::size_t begin = 0; begin < m_all_things.size(); begin += chunk_size) {
-                const std::size_t end = std::min(begin + chunk_size, m_all_things.size());
-                submit_thing_chunk(m_all_things, begin, end);
-            }
+    if (!all_things_to_update.empty()) {
+        for (std::size_t begin = 0; begin < all_things_to_update.size(); begin += light_chunk_size) {
+            const std::size_t end = std::min(begin + light_chunk_size, all_things_to_update.size());
+            master_task_list.push_back([this, &all_things_to_update, begin, end] {
+                const auto worker_index = ThreadPool::current_worker_index();
+                std::vector<InteractionRequest>* active_queue = nullptr;
+                if (worker_index < worker_request_queues.size()) {
+                    active_queue = &worker_request_queues[worker_index];
+                }
+                auto* previous_queue = activate_request_queue(active_queue);
+                auto& rng = get_thread_local_rng();
+
+                for (std::size_t i = begin; i < end; ++i) {
+                    auto& individual = all_things_to_update[i];
+                    if (individual) {
+                        individual->decide(*this, rng);
+                    }
+                }
+
+                restore_request_queue(previous_queue);
+            });
         }
+    }
+
+    auto& rng = get_thread_local_rng();
+    std::shuffle(master_task_list.begin(), master_task_list.end(), rng);
+
+    pool.submit_bulk(std::move(master_task_list));
+}
+
+// Consolidate per-thread queues into the shared staging buffer.
+void EcosystemState::merge_worker_queues() {
+    staged_requests.clear();
+
+    for (auto& queue : worker_request_queues) {
+        if (queue.empty()) {
+            continue;
+        }
+        staged_requests.insert(staged_requests.end(),
+                               std::make_move_iterator(queue.begin()),
+                               std::make_move_iterator(queue.end()));
+        queue.clear();
+    }
+
+    if (!main_thread_requests.empty()) {
+        staged_requests.insert(staged_requests.end(),
+                               std::make_move_iterator(main_thread_requests.begin()),
+                               std::make_move_iterator(main_thread_requests.end()));
+        main_thread_requests.clear();
     }
 }
 
@@ -458,91 +521,24 @@ void EcosystemState::dispatch_decision_tasks(ThreadPool& pool) {
  * @brief 解决在决策阶段产生的所有交互请求。
  *
  * 此函数是并发更新的第二阶段（交互解决阶段）。它首先将所有工作线程的
- * 本地请求队列中的请求移动到一个统一的 `staged_requests` 队列中，
- * 然后遍历这些请求，并根据请求类型（如捕食、繁殖）更新相关的状态
- * （如标记死亡、记录能量变化、标记出生）。
+ * 本地请求队列中的请求移动到一个统一的 `staged_requests` 队列中，并清理上
+ * 一轮的解析状态，然后将请求批次交给 `InteractionResolver` 处理，后者负责根
+ * 据请求类型更新本轮的死亡标记、能量变化和繁殖登记等结果。
  *
  * 这是一个同步点，确保在进入下一阶段（应用阶段）之前，所有交互都已解决。
  */
 void EcosystemState::resolve_interactions() {
-    // 清空上一轮的暂存请求。
-    staged_requests.clear();
-    // 将所有工作线程的本地请求队列中的请求移动到统一的 `staged_requests` 队列中。
-    // 使用 `std::make_move_iterator` 可以高效地转移请求，避免不必要的拷贝。
-    for (auto& queue : worker_request_queues) {
-        if (!queue.empty()) {
-            staged_requests.insert(staged_requests.end(),
-                                   std::make_move_iterator(queue.begin()),
-                                   std::make_move_iterator(queue.end()));
-            queue.clear();
-        }
-    }
-
-    // 如果主线程（或单线程模式）也有请求，同样移入暂存队列。
-    if (!main_thread_requests.empty()) {
-        staged_requests.insert(staged_requests.end(),
-                               std::make_move_iterator(main_thread_requests.begin()),
-                               std::make_move_iterator(main_thread_requests.end()));
-        main_thread_requests.clear();
-    }
+    // 标记当前阶段为交互解决阶段
+    current_phase = UpdatePhase::Resolve;
+    merge_worker_queues();
+    m_resolution_state.clear();
 
     // 如果没有需要处理的请求，则提前返回。
     if (staged_requests.empty()) {
         return;
     }
 
-    // 遍历所有暂存的请求，并根据其类型进行处理。
-    for (auto& request : staged_requests) {
-        // 使用 `std::visit` 和 `std::variant` 来处理不同类型的请求。
-        std::visit([this](auto&& req) {
-            using RequestType = std::decay_t<decltype(req)>;
-            if constexpr (std::is_same_v<RequestType, AttemptToEatRaceRequest>) {
-                auto& initiator = req.initiator;
-                auto& target = req.target;
-                if (!initiator || !target) return;
-                if (!initiator->alive || !target->alive) return;
-
-                if (race_marked_for_death.find(target.get()) != race_marked_for_death.end()) return;
-
-                race_marked_for_death.insert(target.get());
-                race_energy_changes[initiator.get()] += target->energy;
-                target->die_from_predation(initiator->species_name);
-            } else if constexpr (std::is_same_v<RequestType, AttemptToEatThingRequest>) {
-                auto& initiator = req.initiator;
-                auto& target = req.target;
-                if (!initiator || !target) return;
-                if (!initiator->alive || !target->alive) return;
-
-                if (thing_marked_for_death.find(target.get()) != thing_marked_for_death.end()) return;
-
-                thing_marked_for_death.insert(target.get());
-                race_energy_changes[initiator.get()] += target->energy;
-                target->die_from_predation(initiator->species_name);
-            } else if constexpr (std::is_same_v<RequestType, AttemptToReproduceRaceRequest>) {
-                if (req.parent && req.parent->alive) {
-                    reproduction_parents.push_back(std::move(req.parent));
-                }
-            } else if constexpr (std::is_same_v<RequestType, AttemptToReproduceThingRequest>) {
-                if (req.parent && req.parent->alive) {
-                    thing_reproduction_parents.push_back(std::move(req.parent));
-                }
-            } else if constexpr (std::is_same_v<RequestType, AttemptToMateRequest>) {
-                auto& female = req.female;
-                auto& male = req.male;
-
-                if (female && male && female->alive && male->alive &&
-                    female->can_reproduce() && male->mating_timer <= 0)
-                {
-                    female->begin_mating_with(male);
-                    male->begin_mating_with(female);
-                    female->become_pregnant();
-                    male->start_reproduction_cooldown();
-                    female->energy -= female->reproduction_energy_cost;
-                    male->energy -= male->reproduction_energy_cost;
-                }
-            }
-        }, request);
-    }
+    m_interaction_resolver.process_requests(staged_requests, *this, m_resolution_state);
 }
 
 /**
@@ -555,64 +551,65 @@ void EcosystemState::resolve_interactions() {
  * @param pool 要使用的线程池。
  */
 void EcosystemState::dispatch_apply_tasks(ThreadPool& pool) {
-    constexpr std::size_t chunk_size = 1024;
+    current_phase = UpdatePhase::Apply;
 
-    const auto submit_chunk = [this, &pool](std::vector<std::shared_ptr<RaceBase>>& list,
-                                            std::size_t begin,
-                                            std::size_t end) {
-        pool.submit([this, &list, begin, end] {
-            for (std::size_t i = begin; i < end; ++i) {
-                auto& individual = list[i];
-                if (!individual) {
-                    continue;
-                }
-                individual->apply(*this);
-            }
-        });
-    };
+    constexpr std::size_t heavy_chunk_size = 64;
+    constexpr std::size_t light_chunk_size = 4096;
 
-    const auto submit_thing_chunk = [this, &pool](std::vector<std::shared_ptr<ThingBase>>& list,
-                                                  std::size_t begin,
-                                                  std::size_t end) {
-        pool.submit([this, &list, begin, end] {
-            for (std::size_t i = begin; i < end; ++i) {
-                auto& individual = list[i];
-                if (!individual) {
-                    continue;
-                }
-                individual->apply(*this);
-            }
-        });
-    };
-
+    std::vector<std::shared_ptr<RaceBase>> all_races_to_update;
     const auto species_names = races_registry.get_all_species_names();
+    std::size_t total_races = 0;
+    for (const auto& name : species_names) {
+        total_races += races_registry.get_species_list(name).size();
+    }
+    all_races_to_update.reserve(total_races);
     for (const auto& name : species_names) {
         auto& list = races_registry.get_species_list(name);
-        if (list.empty()) {
-            continue;
-        }
+        all_races_to_update.insert(all_races_to_update.end(), list.begin(), list.end());
+    }
+    auto races_agg = std::make_shared<std::vector<std::shared_ptr<RaceBase>>>(std::move(all_races_to_update));
 
-        if (list.size() <= chunk_size) {
-            submit_chunk(list, 0, list.size());
-            continue;
-        }
+    std::vector<std::shared_ptr<ThingBase>>& all_things_to_update = m_all_things;
 
-        for (std::size_t begin = 0; begin < list.size(); begin += chunk_size) {
-            const std::size_t end = std::min(begin + chunk_size, list.size());
-            submit_chunk(list, begin, end);
+    std::vector<std::function<void()>> master_task_list;
+    master_task_list.reserve(
+        (races_agg->size() / heavy_chunk_size) +
+        (all_things_to_update.size() / light_chunk_size) + 2
+    );
+
+    if (!races_agg->empty()) {
+        for (std::size_t begin = 0; begin < races_agg->size(); begin += heavy_chunk_size) {
+            const std::size_t end = std::min(begin + heavy_chunk_size, races_agg->size());
+            master_task_list.push_back([this, races_agg, begin, end] {
+                for (std::size_t i = begin; i < end; ++i) {
+                    auto& individual = (*races_agg)[i];
+                    if (individual) {
+                        individual->apply(*this);
+                    }
+                }
+            });
         }
     }
 
-    if (!m_all_things.empty()) {
-        if (m_all_things.size() <= chunk_size) {
-            submit_thing_chunk(m_all_things, 0, m_all_things.size());
-        } else {
-            for (std::size_t begin = 0; begin < m_all_things.size(); begin += chunk_size) {
-                const std::size_t end = std::min(begin + chunk_size, m_all_things.size());
-                submit_thing_chunk(m_all_things, begin, end);
-            }
+    if (!all_things_to_update.empty()) {
+        for (std::size_t begin = 0; begin < all_things_to_update.size(); begin += light_chunk_size) {
+            const std::size_t end = std::min(begin + light_chunk_size, all_things_to_update.size());
+            master_task_list.push_back([this, &all_things_to_update, begin, end] {
+                for (std::size_t i = begin; i < end; ++i) {
+                    auto& individual = all_things_to_update[i];
+                    if (individual) {
+                        individual->apply(*this);
+                    }
+                }
+            });
         }
     }
+
+    if (!master_task_list.empty()) {
+        std::shuffle(master_task_list.begin(), master_task_list.end(), get_thread_local_rng());
+    }
+
+    pool.submit_bulk(std::move(master_task_list));
 }
 
 /**
@@ -626,167 +623,12 @@ void EcosystemState::dispatch_apply_tasks(ThreadPool& pool) {
  * 并发控制和逻辑。
  */
 void EcosystemState::apply_registry_changes() {
-    // --- 阶段 3/4：应用变更 --- 
-    // 遍历所有物种，处理繁殖、死亡和能量变化。
-
-    // 用于临时存储本轮出生的新个体。
-    std::unordered_map<std::string, std::vector<std::shared_ptr<RaceBase>>> newborns_by_species;
-    newborns_by_species.reserve(reproduction_parents.size());
-    std::unordered_map<std::string, int> thing_birth_counts;
-    std::unordered_map<std::string, int> thing_death_counts;
-    auto logger = spdlog::get("ecosim");
-
-    // --- 出生处理 ---
-    for (auto& parent : reproduction_parents) {
-        if (!parent || !parent->alive) {
-            continue;
-        }
-
-        const auto spawn_position = parent->consume_pending_spawn_position();
-        if (!spawn_position.has_value()) {
-            continue;
-        }
-
-        // 调用工厂时，传入 get_thread_local_rng()
-        auto offspring_unique = g_race_factory.create(parent->species_name, spawn_position.value(), get_thread_local_rng());
-        if (!offspring_unique) {
-            continue;
-        }
-
-        std::shared_ptr<RaceBase> offspring = std::move(offspring_unique);
-        offspring->position = spawn_position.value();
-        newborns_by_species[parent->species_name].push_back(std::move(offspring));
-    }
-
-    for (const auto& name : races_registry.get_all_species_names()) {
-        auto& list = races_registry.get_species_list(name);
-
-        int dead_count = 0;
-        for (auto& individual : list) {
-            if (!individual) {
-                continue;
-            }
-
-            if (race_marked_for_death.find(individual.get()) != race_marked_for_death.end()) {
-                if (individual->alive) {
-                    individual->alive = false;
-                    ++dead_count;
-                }
-                continue;
-            }
-
-            if (auto energy_it = race_energy_changes.find(individual.get());
-                energy_it != race_energy_changes.end()) {
-                individual->energy += energy_it->second;
-            }
-        }
-
-        if (dead_count > 0) {
-            deaths.increment(name, dead_count);
-            spdlog::get("ecosim")->info("💀 {} {} individuals died", dead_count, name);
-        }
-
-        races_registry.filter_alive(name);
-
-        auto newborn_it = newborns_by_species.find(name);
-        if (newborn_it != newborns_by_species.end() && !newborn_it->second.empty()) {
-            races_registry.extend_individuals(name, newborn_it->second);
-            births.increment(name, static_cast<int>(newborn_it->second.size()));
-            spdlog::get("ecosim")->info("{} {} new {} individuals born",
-                (name == "grass" ? "🌱" : name == "cow" ? "🐄" : "🐅"),
-                newborn_it->second.size(), name);
-        }
-    }
-
-    auto remove_it = std::remove_if(m_all_things.begin(), m_all_things.end(),
-        [this, &thing_death_counts](const std::shared_ptr<ThingBase>& thing) {
-            if (!thing) {
-                return true;
-            }
-            if (thing->alive) {
-                return false;
-            }
-            ++thing_death_counts[thing->species_name];
-            detach_thing_from_tile(*thing);
-            return true;
-        });
-    m_all_things.erase(remove_it, m_all_things.end());
-
-    if (config.world_width > 0 && config.world_height > 0) {
-        const int max_x = config.world_width - 1;
-        const int max_y = config.world_height - 1;
-        for (auto& parent : thing_reproduction_parents) {
-            if (!parent || !parent->alive) {
-                continue;
-            }
-            const auto spawn_position = parent->consume_pending_spawn_position();
-            if (!spawn_position.has_value()) {
-                continue;
-            }
-
-            int tile_x = static_cast<int>(std::floor(spawn_position->x));
-            int tile_y = static_cast<int>(std::floor(spawn_position->y));
-            tile_x = std::clamp(tile_x, 0, max_x);
-            tile_y = std::clamp(tile_y, 0, max_y);
-
-            if (!is_valid_grid_coord(tile_x, tile_y)) {
-                continue;
-            }
-
-            Tile& tile = get_tile(tile_x, tile_y);
-            const bool tile_available = std::none_of(tile.things.begin(), tile.things.end(),
-                [](ThingBase* existing) {
-                    return existing != nullptr && existing->alive;
-                });
-            if (!tile_available) {
-                continue;
-            }
-
-            Position world_pos{static_cast<double>(tile_x) + 0.5, static_cast<double>(tile_y) + 0.5};
-            auto offspring_unique = g_thing_factory.create(parent->species_name, world_pos, get_thread_local_rng());
-            if (!offspring_unique) {
-                continue;
-            }
-
-            std::shared_ptr<ThingBase> offspring(std::move(offspring_unique));
-            offspring->position = world_pos;
-            offspring->m_grid_x = tile_x;
-            offspring->m_grid_y = tile_y;
-            attach_thing_to_world(offspring);
-            ++thing_birth_counts[parent->species_name];
-        }
-    }
-
-    for (const auto& [species, count] : thing_birth_counts) {
-        if (count <= 0) {
-            continue;
-        }
-        births.increment(species, count);
-        if (logger) {
-            logger->info("🌱 {} new {} things born", count, species);
-        }
-    }
-
-    for (const auto& [species, count] : thing_death_counts) {
-        if (count <= 0) {
-            continue;
-        }
-        deaths.increment(species, count);
-        if (logger) {
-            logger->info("🥀 {} {} things removed", count, species);
-        }
-    }
-
-    thing_reproduction_parents.clear();
-
-    // --- 清理状态 ---
-    // 清理本轮的状态标记，为下一轮更新做准备。
-    race_marked_for_death.clear();
-    thing_marked_for_death.clear();
-    race_energy_changes.clear();
-    thing_energy_changes.clear();
+    // 标记当前阶段为最终化阶段
+    current_phase = UpdatePhase::Finalize;
+    m_population_manager.apply_changes(*this);
+    m_resolution_state.clear();
     staged_requests.clear();
-    reproduction_parents.clear();
+    current_phase = UpdatePhase::Idle;
 }
 
 /**
@@ -804,6 +646,14 @@ std::mt19937& EcosystemState::get_thread_local_rng() {
  * @param request 要提交的交互请求。
  */
 void EcosystemState::submit_interaction_request(InteractionRequest request) {
+    // 仅允许在决策阶段提交交互请求，其他阶段拒绝并记录日志
+    if (current_phase != UpdatePhase::Decision) {
+        auto logger = spdlog::get("ecosim");
+        if (logger) {
+            logger->warn("Rejecting interaction request outside Decision phase (phase={})", static_cast<int>(current_phase));
+        }
+        return;
+    }
     // 如果当前线程有一个活动的请求队列（在工作线程中），则将请求添加到该队列。
     if (tls_active_queue) {
         tls_active_queue->push_back(std::move(request));
@@ -893,19 +743,18 @@ SpeciesPopulationData EcosystemState::get_species_data() const {
  */
 void EcosystemState::reset(const EcosystemConfig& new_config) {
     config = new_config;
-    time_step = 0;
-    races_registry.clear_all();
+    m_clock.attach_config(&config);
+    m_clock.reset();
+    // 重新构造注册表以应用新的初始数量
+    races_registry = RacesRegistry(config);
     births.reset();
     deaths.reset();
     population_history.clear();
     // 清理并发更新相关的状态
     staged_requests.clear();
     main_thread_requests.clear();
-    race_energy_changes.clear();
-    race_marked_for_death.clear();
-    thing_energy_changes.clear();
-    thing_marked_for_death.clear();
-    reproduction_parents.clear();
+    m_resolution_state.clear();
+    m_thing_counts.clear();
     const double cell = spatial_grid ? spatial_grid->get_cell_size() : 100.0;
     spatial_grid = std::make_unique<SpatialGrid>(config.world_width, config.world_height, cell);
     initialize_populations();
@@ -954,74 +803,329 @@ std::vector<std::shared_ptr<RaceBase>> EcosystemState::get_nearby_races_broad(
 std::vector<std::shared_ptr<ThingBase>> EcosystemState::get_nearby_things_broad(
     const Position& center,
     double radius) const {
-    std::vector<std::shared_ptr<ThingBase>> nearby;
-    if (radius < 0.0) {
-        return nearby;
+    return m_world_grid.get_nearby_things_broad(center, radius);
+}
+
+std::vector<std::shared_ptr<RaceBase>> EcosystemState::get_races_in_range(
+    const std::vector<std::string>& species_names,
+    const Position& center,
+    double radius) const {
+    if (radius < 0.0 || species_names.empty()) {
+        return {};
+    }
+    ZoneScoped;
+    const auto nearby_races = get_nearby_races_broad(center, radius);
+    std::vector<std::shared_ptr<RaceBase>> results;
+    results.reserve(nearby_races.size());
+    const double radius_sq = radius * radius;
+
+    for (const auto& race : nearby_races) {
+        if (!race || !race->alive) {
+            continue;
+        }
+        if (std::find(species_names.begin(), species_names.end(), race->species_name) == species_names.end()) {
+            continue;
+        }
+
+        const double dx = race->position.x - center.x;
+        const double dy = race->position.y - center.y;
+        if ((dx * dx + dy * dy) <= radius_sq) {
+            results.push_back(race);
+        }
     }
 
+    return results;
+}
+
+std::vector<std::shared_ptr<ThingBase>> EcosystemState::get_things_in_range(
+    const std::vector<std::string>& species_names,
+    const Position& center,
+    double radius) const {
+    if (radius < 0.0 || species_names.empty()) {
+        return {};
+    }
+    ZoneScoped;
+    const auto nearby_things = get_nearby_things_broad(center, radius);
+    std::vector<std::shared_ptr<ThingBase>> results;
+    results.reserve(nearby_things.size());
     const double radius_sq = radius * radius;
-    nearby.reserve(m_all_things.size());
-    for (const auto& thing : m_all_things) {
+
+    for (const auto& thing : nearby_things) {
         if (!thing || !thing->alive) {
             continue;
         }
+        if (std::find(species_names.begin(), species_names.end(), thing->species_name) == species_names.end()) {
+            continue;
+        }
+
         const double dx = thing->position.x - center.x;
         const double dy = thing->position.y - center.y;
         if ((dx * dx + dy * dy) <= radius_sq) {
-            nearby.push_back(thing);
+            results.push_back(thing);
         }
     }
 
-    return nearby;
+    return results;
+}
+
+std::vector<std::shared_ptr<ThingBase>> EcosystemState::find_nearest_things(
+    const Position& center,
+    const std::vector<std::string>& species_names,
+    std::size_t n,
+    double max_radius) const {
+    ZoneScoped;
+
+    // --- 边界条件 ---
+    if (n == 0 || max_radius < 0.0 || species_names.empty()) {
+        return {};
+    }
+
+    const int grid_width = m_world_grid.width();
+    const int grid_height = m_world_grid.height();
+    if (grid_width <= 0 || grid_height <= 0) {
+        return {};
+    }
+
+    const double max_radius_sq = max_radius * max_radius;
+
+    // --- 结果与过滤集初始化 ---
+    std::vector<std::shared_ptr<ThingBase>> results;
+    results.reserve(n);
+
+    const std::unordered_set<std::string> species_filter(species_names.begin(), species_names.end());
+    std::unordered_set<const ThingBase*> added_things;
+
+    // --- BFS 队列与本地访问网格 ---
+    std::queue<std::pair<int, int>> frontier;
+    const int radius_in_tiles = static_cast<int>(std::ceil(max_radius));
+    const int local_grid_dim = 2 * radius_in_tiles + 1;
+    const std::size_t local_total_size = static_cast<std::size_t>(local_grid_dim) * static_cast<std::size_t>(local_grid_dim);
+    std::vector<char> local_visited(local_total_size, 0); // Local grid keeps visited markers bounded by radius
+
+    int start_x = static_cast<int>(std::floor(center.x));
+    int start_y = static_cast<int>(std::floor(center.y));
+    start_x = std::clamp(start_x, 0, grid_width - 1);
+    start_y = std::clamp(start_y, 0, grid_height - 1);
+    const int local_origin_x = start_x - radius_in_tiles;
+    const int local_origin_y = start_y - radius_in_tiles;
+
+    // 8方向（菱形螺旋的广义邻域）
+    const std::array<std::pair<int, int>, 8> directions{{
+        {1, 0}, {-1, 0}, {0, 1}, {0, -1},
+        {1, 1}, {1, -1}, {-1, 1}, {-1, -1}
+    }};
+
+    // 入队辅助函数
+    const auto try_enqueue = [&](int x, int y) {
+        if (x < 0 || x >= grid_width || y < 0 || y >= grid_height) {
+            return;
+        }
+
+        const int local_x = x - local_origin_x;
+        const int local_y = y - local_origin_y;
+        if (local_x < 0 || local_x >= local_grid_dim || local_y < 0 || local_y >= local_grid_dim) {
+            return;
+        }
+
+        const std::size_t local_idx = static_cast<std::size_t>(local_y) * static_cast<std::size_t>(local_grid_dim) + static_cast<std::size_t>(local_x);
+        if (local_visited[local_idx]) {
+            return;
+        }
+        local_visited[local_idx] = 1;
+
+        // 半径剪枝：该地块的最近点也超出半径则跳过
+        if (min_distance_sq_to_tile(center, x, y) > max_radius_sq) {
+            return;
+        }
+
+        frontier.emplace(x, y);
+    };
+
+    // 起始地块（准备BFS）
+    {
+        ZoneScopedN("Setup BFS");
+        try_enqueue(start_x, start_y);
+    }
+
+    // --- 螺旋（BFS）搜索 ---
+    int cnt = 0;
+    {
+        ZoneScopedN("Exec BFS");
+        while (!frontier.empty()) {
+            cnt++;
+            auto [tile_x, tile_y] = frontier.front();
+            frontier.pop();
+
+        const Tile& tile = m_world_grid.get_tile(tile_x, tile_y);
+        for (ThingBase* thing_ptr : tile.things) {
+            if (!thing_ptr || !thing_ptr->alive) {
+                continue;
+            }
+            if (added_things.count(thing_ptr)) {
+                continue;
+            }
+            if (species_filter.find(thing_ptr->species_name) == species_filter.end()) {
+                continue;
+            }
+
+            if (squared_distance(center, thing_ptr->position) <= max_radius_sq) {
+                results.push_back(thing_ptr->shared_from_this());
+                added_things.insert(thing_ptr);
+
+                if (results.size() >= n) {
+                    spdlog::info("find_nearest_things: {} tiles visited", cnt);
+                    return results;
+                }
+            }
+        }
+
+            for (const auto& [dx, dy] : directions) {
+                try_enqueue(tile_x + dx, tile_y + dy);
+            }
+        }
+    }
+
+    // 未找到足够目标，返回已有结果
+    return results;
+}
+
+std::vector<std::shared_ptr<RaceBase>> EcosystemState::find_nearest_races(
+    const Position& center,
+    const std::vector<std::string>& species_names,
+    std::size_t n,
+    double max_radius) const {
+    ZoneScoped;
+    if (!spatial_grid || n == 0 || max_radius < 0.0 || species_names.empty()) {
+        return {};
+    }
+
+    const double cell_size = spatial_grid->get_cell_size();
+    const int grid_width = spatial_grid->get_width();
+    const int grid_height = spatial_grid->get_height();
+    if (cell_size <= 0.0 || grid_width <= 0 || grid_height <= 0) {
+        return {};
+    }
+
+    const double max_radius_sq = max_radius * max_radius;
+    const std::unordered_set<std::string> species_filter(species_names.begin(), species_names.end());
+
+    using Candidate = NearestCandidate<RaceBase>;
+    std::priority_queue<Candidate, std::vector<Candidate>, FarthestFirst<RaceBase>> heap;
+
+    const auto width_sz = static_cast<std::size_t>(grid_width);
+    const auto height_sz = static_cast<std::size_t>(grid_height);
+    std::vector<char> visited(width_sz * height_sz, 0);
+    const auto index_for = [width_sz](int x, int y) {
+        return static_cast<std::size_t>(y) * width_sz + static_cast<std::size_t>(x);
+    };
+
+    int start_x = static_cast<int>(std::floor(center.x / cell_size));
+    int start_y = static_cast<int>(std::floor(center.y / cell_size));
+    start_x = std::clamp(start_x, 0, grid_width - 1);
+    start_y = std::clamp(start_y, 0, grid_height - 1);
+
+    std::queue<std::pair<int, int>> frontier;
+    const std::array<std::pair<int, int>, 8> directions{{
+        std::make_pair(1, 0), std::make_pair(-1, 0), std::make_pair(0, 1), std::make_pair(0, -1),
+        std::make_pair(1, 1), std::make_pair(1, -1), std::make_pair(-1, 1), std::make_pair(-1, -1)
+    }};
+
+    const auto try_enqueue = [&](int x, int y) {
+        if (x < 0 || x >= grid_width || y < 0 || y >= grid_height) {
+            return;
+        }
+        const auto idx = index_for(x, y);
+        if (visited[idx]) {
+            return;
+        }
+
+        const double cell_min_dist_sq = min_distance_sq_to_spatial_cell(center, x, y, cell_size);
+        if (cell_min_dist_sq > max_radius_sq) {
+            visited[idx] = 1;
+            return;
+        }
+
+        if (heap.size() >= n) {
+            const double current_far_sq = heap.top().distance_sq;
+            if (cell_min_dist_sq > current_far_sq) {
+                return;
+            }
+        }
+
+        visited[idx] = 1;
+        frontier.emplace(x, y);
+    };
+
+    try_enqueue(start_x, start_y);
+
+    const auto& grid = spatial_grid->cells();
+    while (!frontier.empty()) {
+        const auto [cell_x, cell_y] = frontier.front();
+        frontier.pop();
+
+        const auto& bucket = grid[static_cast<std::size_t>(cell_x)][static_cast<std::size_t>(cell_y)];
+        for (const auto& race : bucket) {
+            if (!race || !race->alive) {
+                continue;
+            }
+            if (species_filter.find(race->species_name) == species_filter.end()) {
+                continue;
+            }
+
+            const double dist_sq = squared_distance(center, race->position);
+            if (dist_sq > max_radius_sq) {
+                continue;
+            }
+
+            if (heap.size() < n) {
+                heap.push(Candidate{dist_sq, race});
+            } else if (dist_sq < heap.top().distance_sq) {
+                heap.pop();
+                heap.push(Candidate{dist_sq, race});
+            }
+        }
+
+        if (heap.size() >= n && heap.top().distance_sq <= 0.0) {
+            break;
+        }
+
+        for (const auto& [dx, dy] : directions) {
+            try_enqueue(cell_x + dx, cell_y + dy);
+        }
+    }
+
+    std::vector<Candidate> ordered;
+    ordered.reserve(heap.size());
+    while (!heap.empty()) {
+        ordered.push_back(heap.top());
+        heap.pop();
+    }
+
+    std::sort(ordered.begin(), ordered.end(), [](const Candidate& lhs, const Candidate& rhs) {
+        return lhs.distance_sq < rhs.distance_sq;
+    });
+
+    std::vector<std::shared_ptr<RaceBase>> nearest;
+    nearest.reserve(ordered.size());
+    for (auto& entry : ordered) {
+        if (entry.target) {
+            nearest.push_back(std::move(entry.target));
+        }
+    }
+
+    return nearest;
 }
 
 std::vector<std::shared_ptr<RaceBase>> EcosystemState::get_races_in_range(
     const std::string& species_name,
     const Position& center,
     double radius) const {
-    std::vector<std::shared_ptr<RaceBase>> result;
-    if (!races_registry.has_species(species_name)) {
-        return result;
-    }
-
-    const auto& list = races_registry.get_species_list(species_name);
-    const double radius_sq = radius * radius;
-    result.reserve(list.size());
-    for (const auto& individual : list) {
-        if (!individual || !individual->alive) {
-            continue;
-        }
-        const double dx = individual->position.x - center.x;
-        const double dy = individual->position.y - center.y;
-        if ((dx * dx + dy * dy) <= radius_sq) {
-            result.push_back(individual);
-        }
-    }
-
-    return result;
+    return get_races_in_range(std::vector<std::string>{species_name}, center, radius);
 }
 
 std::vector<std::shared_ptr<ThingBase>> EcosystemState::get_things_in_range(
     const std::string& species_name,
     const Position& center,
     double radius) const {
-    std::vector<std::shared_ptr<ThingBase>> result;
-    const double radius_sq = radius * radius;
-    result.reserve(m_all_things.size());
-
-    for (const auto& thing : m_all_things) {
-        if (!thing || !thing->alive) {
-            continue;
-        }
-        if (thing->species_name != species_name) {
-            continue;
-        }
-        const double dx = thing->position.x - center.x;
-        const double dy = thing->position.y - center.y;
-        if ((dx * dx + dy * dy) <= radius_sq) {
-            result.push_back(thing);
-        }
-    }
-
-    return result;
+    return get_things_in_range(std::vector<std::string>{species_name}, center, radius);
 }

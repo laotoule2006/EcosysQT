@@ -2,15 +2,18 @@
 #include "simulation.h"
 #include "race_base.h"
 #include "thing_base.h"
+#include "animal.h"
+#include "CameraController.h"
+#include "SimulationRenderer.h"
 #include <QPainter>
 #include <QDebug>
 #include <algorithm>
-// --- 新增：包含鼠标事件头文件 ---
 #include <QWheelEvent>
 #include <QMouseEvent>
+#include <QHBoxLayout>
+#include <QInputDialog>
+#include "map_config_loader.h"
 
-// --- 新增：前向声明一个辅助函数 ---
-static QPointF screenToWorldCoords(const QPointF& screenPos, const QPointF& viewCenter, double zoomFactor, const QSize& screenSize, const QSize& worldSize);
 /**
  * 构造函数实现
  * 
@@ -27,36 +30,131 @@ static QPointF screenToWorldCoords(const QPointF& screenPos, const QPointF& view
 Widget::Widget(SimulationController* controller, QWidget *parent)
     : QWidget(parent)
     , m_controller(controller)
+    , m_currentData(std::make_shared<EcosystemStateData>())
     , m_updateTimer(new QTimer(this))
+    , m_isDragging(false)
+    , m_isInspectMode(false)
+#ifdef ECOSIM_ENABLE_UI_DEBUG
+    , m_showHistory(false)
+#endif
+    , m_currentSpeedLevel(2)
+    // --- 初始化统计数据缓存 ---
     , m_grassCount(0)
     , m_cowCount(0)
     , m_tigerCount(0)
     , m_timeStep(0)
-    , m_currentYear(1)   // 初始化新增变量
-    , m_currentDay(1)    // 初始化新增变量
-    , m_currentQuadrumName("Aprimay") // 初始化新增变量
-    , m_zoomFactor(1.0)
-    , m_isDragging(false)
+    , m_currentYear(1)
+    , m_currentDay(1)
+    , m_currentQuadrumName("Aprimay")
+    , m_currentHour(0)
+    , m_currentMinute(0)
+    , m_current_tps(0.0)
 {
-    m_backgroundImage.load(":/images/grass.png");
-    if (m_backgroundImage.isNull()) {
-        qDebug() << "警告: 背景图加载失败，使用纯色背景";
+    // --- 初始化子系统 ---
+    if (m_controller) {
+        auto initialData = m_controller->get_data();
+        if (initialData) {
+            m_currentData = initialData;
+            // 创建相机控制器，并传入世界尺寸
+            m_cameraController = std::make_unique<CameraController>(initialData->world_width, initialData->world_height);
+        }
     }
-    
-    
+    // 如果相机控制器没有被成功创建（例如后端数据获取失败），创建一个默认的
+    if (!m_cameraController) {
+        m_cameraController = std::make_unique<CameraController>(8000, 6000); // 使用一个默认尺寸
+    }
+    // 创建渲染器
+    m_renderer = std::make_unique<SimulationRenderer>(this);
+
+    // --- 创建所有控制按钮 ---
+    m_exitButton = new QPushButton("退出模拟", this);
+    m_inspectButton = new QPushButton("查看属性", this);
+    m_restartButton = new QPushButton("重新开始", this);
+    m_customSpeedButton = new QPushButton("自定义速度", this);
+    m_pauseButton = new QPushButton("暂停", this);
+    m_slowDownButton = new QPushButton("减速 (-)", this);
+    m_speedUpButton = new QPushButton("加速 (+)", this);
+#ifdef ECOSIM_ENABLE_UI_DEBUG
+    m_historyButton = new QPushButton("显示历史 (OFF)", this);
+#endif
+
+    // --- 设置按钮样式 ---
+    QString buttonStyle = "QPushButton { background-color: rgba(0, 0, 0, 180); color: white; border: 1px solid white; padding: 5px; border-radius: 3px; min-width: 80px; } QPushButton:hover { background-color: rgba(255, 255, 255, 50); } QPushButton:pressed { background-color: rgba(0, 0, 0, 220); }";
+    m_exitButton->setStyleSheet(buttonStyle);
+    m_inspectButton->setStyleSheet(buttonStyle);
+    m_restartButton->setStyleSheet(buttonStyle);
+    m_customSpeedButton->setStyleSheet(buttonStyle);
+    m_pauseButton->setStyleSheet(buttonStyle);
+    m_slowDownButton->setStyleSheet(buttonStyle);
+    m_speedUpButton->setStyleSheet(buttonStyle);
+#ifdef ECOSIM_ENABLE_UI_DEBUG
+    m_historyButton->setStyleSheet(buttonStyle);
+#endif
+
+    // --- 按钮布局 (保持不变) ---
+    QHBoxLayout* topRowLayout = new QHBoxLayout();
+    topRowLayout->addWidget(m_inspectButton);
+#ifdef ECOSIM_ENABLE_UI_DEBUG
+    topRowLayout->addWidget(m_historyButton);
+    m_historyButton->setVisible(false);
+#endif
+    topRowLayout->addWidget(m_restartButton);
+    topRowLayout->addWidget(m_exitButton);
+    QHBoxLayout* bottomRowLayout = new QHBoxLayout();
+    bottomRowLayout->addWidget(m_slowDownButton);
+    bottomRowLayout->addWidget(m_pauseButton);
+    bottomRowLayout->addWidget(m_speedUpButton);
+    QHBoxLayout* customSpeedLayout = new QHBoxLayout();
+    customSpeedLayout->addStretch();
+    customSpeedLayout->addWidget(m_customSpeedButton);
+    customSpeedLayout->addStretch();
+    QVBoxLayout* controlsLayout = new QVBoxLayout();
+    controlsLayout->addLayout(topRowLayout);
+    controlsLayout->addLayout(bottomRowLayout);
+    controlsLayout->addLayout(customSpeedLayout);
+    QHBoxLayout* hLayout = new QHBoxLayout();
+    hLayout->addStretch();
+    hLayout->addLayout(controlsLayout);
+    QVBoxLayout* mainLayout = new QVBoxLayout(this);
+    mainLayout->addStretch();
+    mainLayout->addLayout(hLayout);
+    mainLayout->setContentsMargins(10, 10, 10, 10);
+    setLayout(mainLayout);
+
+    // --- 连接信号和槽 ---
+    connect(m_exitButton, &QPushButton::clicked, this, &Widget::onExitToStartScreenClicked);
+    connect(m_inspectButton, &QPushButton::clicked, this, &Widget::onInspectButtonClicked);
+    connect(m_restartButton, &QPushButton::clicked, this, &Widget::onRestartClicked);
+    connect(m_customSpeedButton, &QPushButton::clicked, this, &Widget::onCustomSpeedClicked);
+    connect(m_pauseButton, &QPushButton::clicked, this, &Widget::onPauseResumeClicked);
+    connect(m_slowDownButton, &QPushButton::clicked, this, &Widget::onSlowDownClicked);
+    connect(m_speedUpButton, &QPushButton::clicked, this, &Widget::onSpeedUpClicked);
+#ifdef ECOSIM_ENABLE_UI_DEBUG
+    connect(m_historyButton, &QPushButton::clicked, this, &Widget::onToggleHistoryClicked);
+#endif
     connect(m_updateTimer, &QTimer::timeout, this, &Widget::updateFrame);
-    m_updateTimer->start(16);
+    
+    m_updateTimer->start(16); // 约 60 FPS 的UI刷新率
     
     if (m_controller) {
-        m_currentData = m_controller->get_data();
-        updateStatistics();
-        // --- 新增：初始化视图中心为世界中心 ---
-        m_viewCenter = QPointF(m_currentData.world_width / 2.0, m_currentData.world_height / 2.0);
+        m_controller->set_target_fps(30);
+        // 初始化时获取一次数据，确保相机和统计数据被正确设置
+        updateFrame();
+    }
+
+    // --- 新增：设置相机初始视图为世界中心的 1/4（zoom = 4） ---
+    if (m_cameraController && m_currentData) {
+        // 初始缩放因子：显示地图的 1/4
+        m_cameraController->setZoomFactor(4.0);
+        m_cameraController->setViewCenter(QPointF(m_currentData->world_width / 2.0, m_currentData->world_height / 2.0));
+        // 在构造时尝试 clamp（若窗口尺寸可用）
+        m_cameraController->clampToBounds(size());
     }
 }
 
 Widget::~Widget()
 {
+    // unique_ptr 会在这里自动释放 m_cameraController 和 m_renderer
 }
 
 /**
@@ -66,8 +164,6 @@ Widget::~Widget()
  * 1. 调用 controller->get_data() 获取最新的数据快照
  * 2. 更新统计数据缓存
  * 3. 触发重绘
- * 
- * 调用频率：每 1000ms (1秒) 执行一次
  */
 void Widget::updateFrame()
 {
@@ -76,238 +172,90 @@ void Widget::updateFrame()
         return;
     }
     
-    // ========== 从后端获取数据快照 ==========
-    // get_data() 返回 EcosystemStateData，提供独立的 race_lists 和 thing_lists
-    // key: 物种名称（小写），value: 存活实体的共享指针列表
-    m_currentData = m_controller->get_data();
+    auto newData = m_controller->get_data();
+    if (newData) {
+        m_currentData = newData;
+    }
     
     updateStatistics();
-    update();
+    update(); // 请求重绘
 }
 
 /**
  * 更新统计数据
  * 
  * 从 m_currentData 中提取各物种的数量
- * 
- * 数据来源：
- * m_currentData.race_lists / thing_lists
- *   └─ key: std::string 物种名称（小写）
- *   └─ value: std::vector<std::shared_ptr<RaceBase/ThingBase>> 个体列表
- *       └─ individual->alive (bool 是否存活)
  */
 void Widget::updateStatistics()
 {
-    if (!m_controller) {
-        return;
-    }
+    if (!m_controller) return;
+    const auto data = m_currentData;
+    if (!data) return;
     
     m_grassCount = 0;
     m_cowCount = 0;
     m_tigerCount = 0;
     
-    m_timeStep = m_currentData.time_step;
-    m_currentYear = m_currentData.current_year;
-    m_currentDay = m_currentData.current_day;
-    m_currentQuadrumName = m_currentData.current_quadrum_name;
-    // 汇总 races 数量
-    for (const auto& [name, individuals] : m_currentData.race_lists) {
-        int alive_count = 0;
-        for (const auto& individual : individuals) {
-            if (individual && individual->alive) {
-                ++alive_count;
-            }
-        }
+    m_timeStep = data->time_step;
+    m_currentYear = data->current_year;
+    m_currentDay = data->current_day;
+    m_currentQuadrumName = data->current_quadrum_name;
+    m_currentHour = data->current_hour;
+    m_currentMinute = data->current_minute;
+    m_current_tps = data->current_tps;
 
-        if (name == "cow") {
-            m_cowCount = alive_count;
-        } else if (name == "tiger") {
-            m_tigerCount = alive_count;
-        }
-    }
-
-    // 汇总 things 数量
-    for (const auto& [name, individuals] : m_currentData.thing_lists) {
-        int alive_count = 0;
-        for (const auto& individual : individuals) {
-            if (individual && individual->alive) {
-                ++alive_count;
-            }
-        }
-
-        if (name == "grass") {
-            m_grassCount = alive_count;
-        }
-    }
+    if(data->race_lists.count("cow")) m_cowCount = data->race_lists.at("cow").size();
+    if(data->race_lists.count("tiger")) m_tigerCount = data->race_lists.at("tiger").size();
+    if(data->thing_lists.count("grass")) m_grassCount = data->thing_lists.at("grass").size();
 }
 
 /**
  * 绘图事件处理函数
  * 
- * 绘制流程：
- * 1. 绘制背景
- * 2. 分别遍历 race_lists 与 thing_lists 绘制所有生物
- * 3. 绘制信息面板
+ * 将所有绘制工作委托给 SimulationRenderer
  */
 void Widget::paintEvent(QPaintEvent *event)
 {
+    Q_UNUSED(event);
     QPainter painter(this);
-    painter.setRenderHint(QPainter::Antialiasing);
-    
-    // ========== 步骤1: 绘制背景 ==========
-    if (!m_backgroundImage.isNull()) {
-        painter.drawPixmap(rect(), m_backgroundImage);
-    } else {
-        painter.fillRect(rect(), QColor(34, 139, 34));
-    }
-    
-    // ========== 步骤2: 绘制所有生物 ==========
-    // 循环 1: 绘制 Races (动物)
-    for (const auto& [name, individuals] : m_currentData.race_lists) {
-        QColor color = getColorForName(name);
-        for (const auto& individual : individuals) {
-            if (!individual || !individual->alive) {
-                continue;
-            }
-
-            QPointF screenPos = toScreenCoords(individual->position);
-            const double max_energy = std::max(1.0, individual->max_energy);
-            const double energyRatio = std::clamp(individual->energy / max_energy, 0.0, 1.5);
-            const double radius = 6.0 + energyRatio * 4.0;
-
-            painter.setBrush(color);
-            painter.setPen(QPen(Qt::white, 2));
-            painter.drawEllipse(screenPos, radius, radius);
-        }
-    }
-
-    // 循环 2: 绘制 Things (植物)
-    for (const auto& [name, individuals] : m_currentData.thing_lists) {
-        QColor color = getColorForName(name);
-        for (const auto& individual : individuals) {
-            if (!individual || !individual->alive) {
-                continue;
-            }
-
-            QPointF screenPos = toScreenCoords(individual->position);
-            painter.setBrush(color);
-            painter.setPen(Qt::NoPen);
-            painter.drawEllipse(screenPos, 3, 3);
-        }
-    }
-    
-    // ========== 步骤3: 绘制信息面板 ==========
-    /**
-     * 信息面板布局：
-     * 
-     * ┌────────────────────────────┐
-     * │ 年: 1   天: 1              │
-     * │ 季: Aprimay                │
-     * │ 时间步: 0                  │
-     * │ 总数量: 85                 │
-     * │ 草:  █ 60                  │
-     * │ 牛:  █ 20                  │
-     * │ 老虎: █ 5                  │
-     * └────────────────────────────┘
-     */
-    QRectF infoRect(10, 10, 280, 184);
-    painter.setBrush(QColor(0, 0, 0, 180));
-    painter.setPen(Qt::NoPen);
-    painter.drawRoundedRect(infoRect, 5, 5);
-    
-    painter.setPen(Qt::white);
-    QFont font("Arial", 12, QFont::Bold);
-    painter.setFont(font);
-    
-    int textY = 30;
-    int lineHeight = 24;
-    
-    painter.drawText(20, textY, QString("年: %1   天: %2").arg(m_currentYear).arg(m_currentDay));
-    textY += lineHeight;
-    
-    painter.drawText(20, textY, QString("季: %1").arg(QString::fromStdString(m_currentQuadrumName)));
-    textY += lineHeight;
-    
-    painter.drawText(20, textY, QString("时间步: %1").arg(m_timeStep));
-    textY += lineHeight;
-    
-    int totalCount = m_grassCount + m_cowCount + m_tigerCount;
-    painter.drawText(20, textY, QString("总数量: %1").arg(totalCount));
-    textY += lineHeight;
-    
-    painter.drawText(20, textY, "草: ");
-    painter.fillRect(70, textY - 14, 18, 18, getColorForName("grass"));
-    painter.drawText(95, textY, QString::number(m_grassCount));
-    textY += lineHeight;
-    
-    painter.drawText(20, textY, "牛: ");
-    painter.fillRect(70, textY - 14, 18, 18, getColorForName("cow"));
-    painter.drawText(95, textY, QString::number(m_cowCount));
-    textY += lineHeight;
-    
-    painter.drawText(20, textY, "老虎: ");
-    painter.fillRect(70, textY - 14, 18, 18, getColorForName("tiger"));
-    painter.drawText(95, textY, QString::number(m_tigerCount));
+    m_renderer->render(painter, m_currentData, *m_cameraController, m_hoveredEntity, m_selectedEntity, m_isInspectMode);
 }
 
-// --- 新增：实现 wheelEvent 函数 ---
 /**
  * 鼠标滚轮事件处理函数
  * 
- * @param event 滚轮事件对象
- * 
- * 逻辑：
- * 1. 获取鼠标当前在屏幕上的位置。
- * 2. 将该屏幕位置转换为缩放前的世界坐标。
- * 3. 根据滚轮方向，计算新的缩放因子 m_zoomFactor。
- * 4. 将该屏幕位置转换为缩放后的世界坐标。
- * 5. 计算两次世界坐标的差值，并用这个差值来平移视图中心 m_viewCenter。
- * 6. 触发界面重绘。
- * 
- * 效果：实现以鼠标指针为中心的缩放。
+ * 将事件委托给 CameraController
  */
 void Widget::wheelEvent(QWheelEvent *event)
 {
-    const QPointF mousePos = event->position();
-    const QSize worldSize(m_currentData.world_width, m_currentData.world_height);
-
-    // 1. 记录缩放前的世界坐标
-    const QPointF worldPosBeforeZoom = screenToWorldCoords(mousePos, m_viewCenter, m_zoomFactor, size(), worldSize);
-
-    // 2. 计算新的缩放因子
-    const double zoomStep = 1.15;
-    if (event->angleDelta().y() > 0) {
-        m_zoomFactor *= zoomStep;
-    } else {
-        m_zoomFactor /= zoomStep;
-    }
-    m_zoomFactor = std::clamp(m_zoomFactor, 0.1, 20.0);
-
-    // 3. 记录缩放后的世界坐标
-    const QPointF worldPosAfterZoom = screenToWorldCoords(mousePos, m_viewCenter, m_zoomFactor, size(), worldSize);
-
-    // 4. 移动视图中心，以保持鼠标下的点位置不变
-    m_viewCenter += (worldPosBeforeZoom - worldPosAfterZoom);
-
+    m_cameraController->handleWheelEvent(event, size());
     update(); // 请求重绘
+    event->accept();
 }
 
-// --- 新增：实现鼠标按下事件 ---
 /**
  * 鼠标按下事件处理函数
  * 
- * @param event 鼠标事件对象
- * 
- * 逻辑：
- * 1. 检查是否是鼠标中键被按下。
- * 2. 如果是，则将 m_isDragging 设为 true，并记录当前鼠标位置。
- * 3. 设置鼠标光标为“抓手”形状，提供视觉反馈。
+ * - 左键：处理实体选择
+ * - 中键：开始视图拖动
  */
 void Widget::mousePressEvent(QMouseEvent *event)
 {
-    if (event->button() == Qt::MiddleButton) {
+    if (event->button() == Qt::LeftButton) {
+        if (m_isInspectMode) {
+            if (m_hoveredEntity.has_value()) {
+                m_selectedEntity = m_hoveredEntity;
+            } else {
+                m_selectedEntity.reset();
+            }
+            update();
+            event->accept();
+        } else {
+            event->ignore();
+        }
+    } else if (event->button() == Qt::MiddleButton) {
         m_isDragging = true;
-        m_lastMousePos = event->localPos();
+        m_cameraController->setLastMousePos(event->localPos());
         setCursor(Qt::ClosedHandCursor);
         event->accept();
     } else {
@@ -315,49 +263,38 @@ void Widget::mousePressEvent(QMouseEvent *event)
     }
 }
 
-// --- 新增：实现鼠标移动事件 ---
 /**
  * 鼠标移动事件处理函数
  * 
- * @param event 鼠标事件对象
- * 
- * 逻辑：
- * 1. 检查 m_isDragging 是否为 true。
- * 2. 如果是，则计算鼠标从上一次位置移动的偏移量（屏幕坐标）。
- * 3. 将这个屏幕偏移量转换为世界坐标下的偏移量。
- * 4. 从视图中心 m_viewCenter 中减去这个世界偏移量，实现视图的平移。
- * 5. 更新上一次鼠标位置。
- * 6. 触发重绘。
+ * - 如果正在拖动：将事件委托给 CameraController 进行平移
+ * - 如果处于查看模式：查找悬停的实体
  */
 void Widget::mouseMoveEvent(QMouseEvent *event)
 {
     if (m_isDragging) {
-        QPointF delta = event->localPos() - m_lastMousePos;
-
-        // 将屏幕上的像素偏移转换为世界坐标下的偏移
-        double worldDeltaX = (delta.x() / width()) * (m_currentData.world_width / m_zoomFactor);
-        double worldDeltaY = (delta.y() / height()) * (m_currentData.world_height / m_zoomFactor);
-
-        // 视图中心向相反方向移动
-        m_viewCenter -= QPointF(worldDeltaX, worldDeltaY);
-
-        m_lastMousePos = event->localPos();
+        m_cameraController->handleMouseMoveEventForPan(event, size());
         update();
         event->accept();
     } else {
+        if (m_isInspectMode) {
+            auto previouslyHovered = m_hoveredEntity;
+            m_hoveredEntity = findEntityAtScreenPos(event->localPos());
+
+            if (previouslyHovered.has_value() != m_hoveredEntity.has_value() ||
+               (previouslyHovered.has_value() && m_hoveredEntity.has_value() &&
+                std::visit([](auto&& arg1){ return (void*)arg1.get(); }, previouslyHovered.value()) !=
+                std::visit([](auto&& arg2){ return (void*)arg2.get(); }, m_hoveredEntity.value()))) {
+                update();
+            }
+        }
         event->ignore();
     }
 }
 
-// --- 新增：实现鼠标释放事件 ---
 /**
  * 鼠标释放事件处理函数
  * 
- * @param event 鼠标事件对象
- * 
- * 逻辑：
- * 1. 检查是否是鼠标中键被释放。
- * 2. 如果是，则将 m_isDragging 设为 false，并恢复鼠标光标形状。
+ * - 中键：结束视图拖动
  */
 void Widget::mouseReleaseEvent(QMouseEvent *event)
 {
@@ -370,83 +307,157 @@ void Widget::mouseReleaseEvent(QMouseEvent *event)
     }
 }
 
-QColor Widget::getColorForName(const std::string& name) const
+// --- 按钮的槽函数 ---
+
+void Widget::onRestartClicked()
 {
-    if (name == "grass") {
-        return QColor(144, 238, 144);
+    if (!m_controller) return;
+    qDebug() << "请求重新开始模拟...";
+    EcosystemConfig newConfig = load_map_config_from_yaml("config/map_config.yaml");
+    qDebug() << "创建新配置: 世界尺寸 " << newConfig.world_width << "x" << newConfig.world_height;
+    for (const auto& pair : newConfig.initial_populations) {
+        qDebug() << " - 初始种群: " << QString::fromStdString(pair.first) << ", 数量: " << pair.second;
     }
-    if (name == "cow") {
-        return QColor(135, 206, 250);
-    }
-    if (name == "tiger") {
-        return QColor(220, 20, 60);
-    }
-    return Qt::gray;
+    m_controller->reset(newConfig);
+    // 重置相机
+    m_cameraController->setZoomFactor(1.0);
+    m_cameraController->setViewCenter(QPointF(newConfig.world_width / 2.0, newConfig.world_height / 2.0));
+    m_currentSpeedLevel = 4;
+    m_pauseButton->setText(m_controller->is_paused() ? "继续" : "暂停");
+    updateFrame();
 }
 
-/**
- * 将世界坐标转换为屏幕坐标
- * 
- * @param pos Position 结构（定义在 utils.h，包含 double x, double y）
- * @return QPointF 屏幕坐标
- * 
- * 坐标系转换：
- * - 世界坐标：(0, 0) ~ (world_width, world_height)
- * - 屏幕坐标：(0, 0) ~ (窗口宽度, 窗口高度)
- * 
- * 转换公式：
- * screenX = (worldX / worldWidth) * windowWidth
- * screenY = (worldY / worldHeight) * windowHeight
- * 
- * 注意：
- * - world_width 和 world_height 从 m_currentData 动态读取
- * - 支持窗口大小调整（自动缩放）
- */
-QPointF Widget::toScreenCoords(const Position& pos) const
+void Widget::onPauseResumeClicked()
 {
-    if (m_currentData.world_width <= 0 || m_currentData.world_height <= 0) {
-        return QPointF();
+    if (!m_controller) return;
+    if (m_controller->is_paused()) {
+        m_controller->resume();
+        m_pauseButton->setText("暂停");
+    } else {
+        m_controller->pause();
+        m_pauseButton->setText("继续");
     }
-
-    // 1. 计算当前缩放级别下，视图在世界坐标系中的可见宽高
-    double visibleWorldWidth = m_currentData.world_width / m_zoomFactor;
-    double visibleWorldHeight = m_currentData.world_height / m_zoomFactor;
-
-    // 2. 计算视图在世界坐标系中的左上角坐标
-    double viewLeft = m_viewCenter.x() - visibleWorldWidth / 2.0;
-    double viewTop = m_viewCenter.y() - visibleWorldHeight / 2.0;
-
-    // 3. 计算目标点相对于视图左上角的偏移
-    double relativeX = pos.x - viewLeft;
-    double relativeY = pos.y - viewTop;
-
-    // 4. 将相对偏移按比例映射到屏幕坐标
-    double screenX = (relativeX / visibleWorldWidth) * width();
-    double screenY = (relativeY / visibleWorldHeight) * height();
-
-    return QPointF(screenX, screenY);
 }
 
-// --- 新增：实现屏幕到世界坐标的转换辅助函数 ---
-/**
- * 将屏幕坐标转换为世界坐标
- * 
- * 这是 toScreenCoords 的逆运算
- */
-static QPointF screenToWorldCoords(const QPointF& screenPos, const QPointF& viewCenter, double zoomFactor, const QSize& screenSize, const QSize& worldSize)
+void Widget::onSpeedUpClicked()
 {
-    if (worldSize.width() <= 0 || worldSize.height() <= 0) {
-        return QPointF();
+    if (!m_controller) return;
+    m_currentSpeedLevel++;
+    const std::map<int, int> speedMap = {
+        {0, 10}, {1, 20}, {2, 30}, {3, 40}, {4, 50}, 
+        {5, 60}, {6, 70}, {7, 80}, {8, 90}, {9, 100}
+    };
+    if (m_currentSpeedLevel > 9) m_currentSpeedLevel = 9;
+    auto it = speedMap.find(m_currentSpeedLevel);
+    if (it != speedMap.end()) {
+        m_controller->set_target_fps(it->second);
+        qDebug() << "速度等级:" << m_currentSpeedLevel << ", FPS:" << it->second;
+    }
+}
+
+void Widget::onSlowDownClicked()
+{
+    if (!m_controller) return;
+    m_currentSpeedLevel--;
+    const std::map<int, int> speedMap = {
+        {0, 10}, {1, 20}, {2, 30}, {3, 40}, {4, 50}, 
+        {5, 60}, {6, 70}, {7, 80}, {8, 90}, {9, 100}
+    };
+    if (m_currentSpeedLevel < 0) m_currentSpeedLevel = 0;
+    auto it = speedMap.find(m_currentSpeedLevel);
+    if (it != speedMap.end()) {
+        m_controller->set_target_fps(it->second);
+        qDebug() << "速度等级:" << m_currentSpeedLevel << ", FPS:" << it->second;
+    }
+}
+
+void Widget::onCustomSpeedClicked()
+{
+    if (!m_controller) return;
+    bool ok;
+    int newFps = QInputDialog::getInt(this, "设置模拟速度", "请输入目标 FPS (1-2000):", 30, 1, 2000, 1, &ok);
+    if (ok) {
+        m_controller->set_target_fps(newFps);
+        qDebug() << "自定义速度已设置为:" << newFps << "FPS";
+    }
+}
+
+void Widget::onInspectButtonClicked()
+{
+    m_isInspectMode = !m_isInspectMode;
+#ifdef ECOSIM_ENABLE_UI_DEBUG
+    m_historyButton->setVisible(m_isInspectMode);
+    if (!m_isInspectMode) {
+        m_showHistory = false;
+        m_historyButton->setText("显示历史 (OFF)");
+    }
+#endif
+    if (m_isInspectMode) {
+        m_inspectButton->setText("退出查看");
+        m_inspectButton->setStyleSheet("QPushButton { background-color: #007ACC; color: white; border: 1px solid #005A9E; padding: 5px; border-radius: 3px; min-width: 80px; }");
+    } else {
+        m_inspectButton->setText("查看属性");
+        QString buttonStyle = "QPushButton { background-color: rgba(0, 0, 0, 180); color: white; border: 1px solid white; padding: 5px; border-radius: 3px; min-width: 80px; } QPushButton:hover { background-color: rgba(255, 255, 255, 50); } QPushButton:pressed { background-color: rgba(0, 0, 0, 220); }";
+        m_inspectButton->setStyleSheet(buttonStyle);
+        m_hoveredEntity.reset();
+        m_selectedEntity.reset();
+        update();
+    }
+}
+
+#ifdef ECOSIM_ENABLE_UI_DEBUG
+void Widget::onToggleHistoryClicked()
+{
+    m_showHistory = !m_showHistory;
+    m_historyButton->setText(m_showHistory ? "显示历史 (ON)" : "显示历史 (OFF)");
+    update();
+}
+#endif
+
+void Widget::onExitToStartScreenClicked()
+{
+    emit exitToStartScreen();
+}
+
+// --- 辅助函数 ---
+
+std::optional<SelectableEntity> Widget::findEntityAtScreenPos(const QPointF& screenPos)
+{
+    const auto data = m_currentData;
+    if (!data) return std::nullopt;
+
+    double closestDistSq = 30.0 * 30.0; // 30像素的点击半径
+    std::optional<SelectableEntity> foundEntity = std::nullopt;
+
+    auto checkList = [&](const auto& list) {
+        for (const auto& individual : list) {
+            if (!individual || !individual->alive) continue;
+            // 使用相机控制器进行坐标转换
+            QPointF individualScreenPos = m_cameraController->toScreenCoords(QPointF(individual->position.x, individual->position.y), size());
+            double distSq = QLineF(screenPos, individualScreenPos).length() * QLineF(screenPos, individualScreenPos).length();
+            if (distSq < closestDistSq) {
+                closestDistSq = distSq;
+                foundEntity = individual;
+            }
+        }
+    };
+
+    // 从后往前检查，优先选中绘制在上面的生物
+    for (auto it = data->race_lists.rbegin(); it != data->race_lists.rend(); ++it) {
+        checkList(it->second);
+    }
+    for (auto it = data->thing_lists.rbegin(); it != data->thing_lists.rend(); ++it) {
+        checkList(it->second);
     }
 
-    double visibleWorldWidth = worldSize.width() / zoomFactor;
-    double visibleWorldHeight = worldSize.height() / zoomFactor;
+    return foundEntity;
+}
 
-    double viewLeft = viewCenter.x() - visibleWorldWidth / 2.0;
-    double viewTop = viewCenter.y() - visibleWorldHeight / 2.0;
-
-    double relativeX = (screenPos.x() / screenSize.width()) * visibleWorldWidth;
-    double relativeY = (screenPos.y() / screenSize.height()) * visibleWorldHeight;
-
-    return QPointF(viewLeft + relativeX, viewTop + relativeY);
+void Widget::resizeEvent(QResizeEvent* event)
+{
+    QWidget::resizeEvent(event);
+    if (m_cameraController) {
+        m_cameraController->clampToBounds(event->size());
+    }
+    update();
 }

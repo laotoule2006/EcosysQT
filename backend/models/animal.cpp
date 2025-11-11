@@ -5,19 +5,25 @@
 
 #include "animal.h"
 #include "race_base.h"
-#include "thing_base.h"
 #include "species_params.h"
 #include "ecosystem.h"
 #include "behavior_tree.h"
+#include "animal_behavior.h"
 #include "tracy/Tracy.hpp"
+#include <spdlog/spdlog.h>
 #include <random>
 #include <algorithm>
 #include <cmath>
 
 // --- Animal ---
 // 动物基类 - 继承自Species并添加智能移动
+// 兼容构造：未提供物种名时，默认使用 "RaceBase"（将回退到代码版行为树）
 Animal::Animal(Position pos, const AnimalParams& params, std::mt19937& rng)
-        : RaceBase(pos, params.energy, params.max_age, params.reproduction_energy_cost),
+        : Animal(pos, std::string("RaceBase"), params, rng) {}
+
+// 主构造：在构造时设置物种名，便于立即加载 YAML 行为树
+Animal::Animal(Position pos, const std::string& species_name, const AnimalParams& params, std::mt19937& rng)
+        : RaceBase(pos, species_name, params.energy, params.max_age, params.reproduction_energy_cost, params.hp_max),
             base_movement_speed(params.movement_speed),
             movement_speed(params.movement_speed),
             base_energy_consumption(params.energy_consumption),
@@ -38,13 +44,37 @@ Animal::Animal(Position pos, const AnimalParams& params, std::mt19937& rng)
             hunger_state(HungerState::NORMAL),
             satisfied_threshold(params.energy * params.satisfied_threshold_ratio),
             starving_threshold(params.energy * params.starving_threshold_ratio),
-            is_wandering(false),
-            wandering_cooldown(params.wandering_duration),
             wander_radius(params.wander_radius),
-            mating_desire_probability(params.mating_desire_probability) {
+            mating_desire_probability(params.mating_desire_probability),
+            nutrition_value(params.nutrition_value) {
+    // 交配/怀孕相关参数初始化
+    mating_duration = params.mating_duration;
+    pregnancy_duration = params.pregnancy_duration;
+    mating_range = params.mating_range;
+    pregnancy_speed_penalty = params.pregnancy_speed_penalty;
     // 初始化每tick步长为当前移动速度（tick制）
     step_distance_per_tick = movement_speed;
     current_step_distance = step_distance_per_tick; // 首帧近似为1 tick
+    // 诊断：构造时确认孕速惩罚与移动速度
+    SPDLOG_LOGGER_DEBUG(spdlog::get("ecosim"),
+        "[Animal Ctor] '{}' created: pregnancy_speed_penalty={:.2f}, movement_speed={:.2f}",
+        species_name, pregnancy_speed_penalty, movement_speed);
+
+    // energy加成 ~ https://doi.org/10.1093/conphys/coac083
+    // 加成公式 = nutrition_bonus_max * pow(prey.energy / prey.max_energy, nutrition_bonus_curve_alpha)
+    // 最终获得能量 gained_energy = (prey.nutrition_value + bonus) * predator.energy_efficiency
+    nutrition_bonus_max = std::max(0.0, params.nutrition_bonus_max);
+    nutrition_bonus_curve_alpha = std::max(0.0, params.nutrition_bonus_curve_alpha);
+
+    // 基础生命恢复量
+    hp_regen_base_per_day = std::max(0.0, params.hp_regen_base_per_day);
+    // 各状态恢复倍率
+    hp_regen_mul_satisfied = std::max(0.0, params.hp_regen_mul_satisfied);
+    hp_regen_mul_normal    = std::max(0.0, params.hp_regen_mul_normal);
+    hp_regen_mul_starving  = std::max(0.0, params.hp_regen_mul_starving);
+    // 恢复触发间隔比例
+    regan_interval_ratio   = std::clamp(params.regan_interval_ratio, 0.0, 1.0);
+    ticks_since_last_regen = 0;
 
     // 使用传递进来的 rng，而不是线程本地的
     std::uniform_int_distribution<> dist(0, 1);
@@ -54,10 +84,8 @@ Animal::Animal(Position pos, const AnimalParams& params, std::mt19937& rng)
     pregnancy_timer = 0;
     mating_timer = 0;
     // 初始化交配意图锁定时长（可按需调整或从参数映射）
-    mating_intent_lock_ticks = 0;
-    mating_intent_lock_duration = 30;
-
-    // 行为树脚手架构建（默认关闭）
+    // 行为树脚手架构建（默认关闭，若 species_name 有对应 YAML 则加载并使用）
+    use_bt = params.use_bt;
     build_behavior_tree();
 }
 
@@ -71,214 +99,15 @@ void Animal::decide(EcosystemState& ecosystem_state, std::mt19937& rng) {
     }
 
     auto self = shared_from_this();
-
-    // --- 1. 状态更新与意图重置 ---
-    pending_move_mode = PendingMoveMode::None;
-    skip_movement = false;
-    current_target.reset(); // 每轮决策前清空最终目标
-    // mating_target 不再每帧重置；通过锁定与条件释放控制
-
-    update_hunger_state();
-    adjust_stats_by_state();
-
-    // 交配意图锁定与释放策略：
-    // - 锁定期间保持交配目标，不进入觅食分支，避免来回切换
-    // - 若进入饥饿严重状态（STARVING）且锁定已结束，则释放交配目标让位觅食
-    if (mating_intent_lock_ticks > 0) {
-        mating_intent_lock_ticks -= 1;
-    } else {
-        if (mating_target.has_value() && hunger_state == HungerState::STARVING) {
-            mating_target.reset();
-        }
-    }
-
-    // --- 2. 处理进行中的高优先级状态 (交配/怀孕) ---
-    if (mating_timer > 0) {
-        mating_timer--;
-        skip_movement = true;
-        return; // 交配中，不做任何其他事
-    }
-    if (is_pregnant) {
-        pregnancy_timer--;
-        if (pregnancy_timer <= 0) {
-            // 怀孕结束，进入分娩流程
-            is_pregnant = false;
-
-            // --- 使用您提供的繁殖逻辑来处理分娩 ---
-            // 1. 计算新生儿出生位置
-            const double radius = reproduction_spawn_radius();
-            std::uniform_real_distribution<> dist_angle(0.0, 2 * M_PI);
-            std::uniform_real_distribution<> dist_radius(0.0, radius);
-            const double angle = dist_angle(rng);
-            const double distance = dist_radius(rng);
-            Position spawn_candidate{
-                std::max(0.0, std::min(static_cast<double>(ecosystem_state.config.world_width), position.x + std::cos(angle) * distance)),
-                std::max(0.0, std::min(static_cast<double>(ecosystem_state.config.world_height), position.y + std::sin(angle) * distance))
-            };
-            pending_spawn_position = spawn_candidate;
-
-            // 2. 提交分娩请求
-            // 注意：能量消耗和冷却已在交配时处理，此处不再重复
-            ecosystem_state.submit_interaction_request(AttemptToReproduceRaceRequest{self});
-            
-            // 分娩时通常会暂停移动
-            skip_movement = true; 
-        }
-    }
-
-    // --- 3. 行为决策 (按优先级进行) ---
-
-    // 优先级 1: 交配意图
-    if (sex == Sex::MALE && can_reproduce()) {
-        // --- 新增：求偶意愿概率判断 ---
-        std::uniform_real_distribution<> desire_dist(0.0, 1.0);
-        if (desire_dist(rng) < mating_desire_probability) { // 只有在随机数小于意愿概率时才去寻找配偶
-            auto mate_opt = find_available_mate(ecosystem_state);
-            if (mate_opt.has_value()) {
-                auto mate = mate_opt.value();
-                if (position.distance_to(mate->position) <= mating_range) {
-                    // 在范围内，提交交配请求
-                    ecosystem_state.submit_interaction_request(AttemptToMateRequest{mate, std::dynamic_pointer_cast<Animal>(self)});
-                    skip_movement = true;
-                } else {
-                    // 不在范围内，将配偶设为最高优先级目标
-                    mating_target = mate->position;
-                    mating_intent_lock_ticks = mating_intent_lock_duration; // 锁定意图一段时间
-                }
-            }
-        }
-    }
-
-    // 优先级 2: 觅食意图 (仅在没有交配目标时考虑)
-    if (!mating_target.has_value()) {
-        if (hunger_state != HungerState::SATISFIED && !food_types.empty()) {
-            const std::string& primary_food = food_types.front();
-            if (primary_food == "grass" && eating_range > 0.0) {
-                if (ecosystem_state.config.world_width > 0 && ecosystem_state.config.world_height > 0) {
-                    const int max_x = ecosystem_state.config.world_width - 1;
-                    const int max_y = ecosystem_state.config.world_height - 1;
-                    int tile_x = static_cast<int>(std::floor(position.x));
-                    int tile_y = static_cast<int>(std::floor(position.y));
-                    tile_x = std::clamp(tile_x, 0, max_x);
-                    tile_y = std::clamp(tile_y, 0, max_y);
-
-                    if (ecosystem_state.is_valid_grid_coord(tile_x, tile_y)) {
-                        Tile& current_tile = ecosystem_state.get_tile(tile_x, tile_y);
-                        for (ThingBase* thing : current_tile.things) {
-                            if (!thing || !thing->alive) {
-                                continue;
-                            }
-                            if (thing->species_name != "grass") {
-                                continue;
-                            }
-
-                            auto target = thing->shared_from_this();
-                            if (!target) {
-                                continue;
-                            }
-
-                            ecosystem_state.submit_interaction_request(
-                                AttemptToEatThingRequest{self, target});
-                            break; // 单次觅食
-                        }
-                    }
-                }
-            }
-
-            if (primary_food == "cow" && hunting_range > 0.0 && hunting_cooldown <= 0) {
-                const double desire = get_hunting_desire();
-                if (desire > 0.0) {
-                    std::uniform_real_distribution<> hunt_dist(0.0, 1.0);
-                    if (hunt_dist(rng) < hunting_success_rate * desire) {
-                        auto nearby_races = ecosystem_state.get_nearby_races_broad(position, hunting_range);
-                        for (const auto& race : nearby_races) {
-                            if (!race || !race->alive) {
-                                continue;
-                            }
-                            if (race.get() == this) {
-                                continue;
-                            }
-                            if (race->species_name != "cow") {
-                                continue;
-                            }
-                            if (position.distance_to(race->position) > hunting_range) {
-                                continue;
-                            }
-
-                            ecosystem_state.submit_interaction_request(AttemptToEatRaceRequest{self, race});
-                            start_hunting_cooldown();
-                            break; // 单次狩猎
-                        }
-                    }
-                }
-            }
-        }
-
-        // --- 这里是您现有的寻找远处食物的逻辑，保持不变 ---
-        select_target_point(ecosystem_state); // 这个函数会尝试为觅食设置 current_target
-    }
-
-    // --- 4. 最终目标确定与移动规划 ---
-    if (skip_movement) {
-        // 如果因提交请求而跳过移动，则清空所有目标
-        current_target.reset();
-        wander_target.reset();
-        mating_target.reset(); // 提交交配或分娩后，释放交配目标避免残留
-    } else {
-        // 按照优先级，将最高意图的目标赋给 current_target
-        if (mating_target.has_value()) {
-            current_target = mating_target; // 交配是最高优先级
-        }
-        // 如果没有交配目标，current_target 可能已经被 select_target_point 设置为食物目标
-
-        if (current_target.has_value()) {
-            // 如果最终确定了目标（无论是配偶还是食物），则规划路径
-            plan_path_to_target(ecosystem_state, current_target);
-            pending_move_mode = PendingMoveMode::Path;
-        } else {
-            // 优先级 3: 游荡意图 (如果没有任何目标)
-            // --- 这里是您现有的游荡逻辑，保持不变 ---
-            const int world_width = ecosystem_state.config.world_width;
-            const int world_height = ecosystem_state.config.world_height;
-            if (wander_target.has_value()) {
-                pending_move_mode = PendingMoveMode::Wander;
-            } else {
-                std::uniform_real_distribution<> angle_dist(0.0, 2 * M_PI);
-                std::uniform_real_distribution<> unit01(0.0, 1.0);
-                // 最多尝试若干次以找到可行走点
-                for (int tries = 0; tries < 6 && !wander_target.has_value(); ++tries) {
-                    const double angle = angle_dist(rng);
-                    // 面积均匀采样半径，并避免极小半径造成近点抖动
-                    const double r = std::max(movement_speed, std::sqrt(unit01(rng)) * wander_radius);
-                    Position candidate{
-                        position.x + std::cos(angle) * r,
-                        position.y + std::sin(angle) * r
-                    };
-                    // 边界约束（可行走区域）
-                    candidate.x = std::max(0.0, std::min(static_cast<double>(world_width), candidate.x));
-                    candidate.y = std::max(0.0, std::min(static_cast<double>(world_height), candidate.y));
-                    // 简易避障：避免目标落在当前个体非常近处（无意义）
-                    if (position.distance_to(candidate) < 1e-6) continue;
-                    // 可在此处扩展更多地形/障碍检查（例如网格标记、不可通行区域等）
-                    wander_target = candidate;
-                }
-                if (!wander_target.has_value()) {
-                    // 兜底：若未选中合法目标，执行一次小幅随机移动
-                    std::uniform_real_distribution<> angle2(0.0, 2 * M_PI);
-                    const double a2 = angle2(rng);
-                    Position fallback{
-                        std::max(0.0, std::min(static_cast<double>(world_width), position.x + std::cos(a2) * movement_speed)),
-                        std::max(0.0, std::min(static_cast<double>(world_height), position.y + std::sin(a2) * movement_speed))
-                    };
-                    wander_target = fallback;
-                }
-                pending_move_mode = PendingMoveMode::Wander;
-            }
-        }
-    }
-
-    if (hunting_cooldown > 0) {
-        hunting_cooldown -= 1;
+    
+    // 行为树路径：将状态更新、计时器推进与副作用统一在 BT 的通用 Action 中
+    if (use_bt && behavior_tree) {
+        bt::TickContext ctx;
+        ctx.self = this;
+        ctx.world = &ecosystem_state;
+        ctx.blackboard = &behavior_tree->blackboard();
+        (void)behavior_tree->tick(ctx);
+        return;
     }
 }
 
@@ -289,38 +118,49 @@ void Animal::apply(const EcosystemState& ecosystem_state) {
         return;
     }
 
-    // 基于tick缩放本次移动距离，确保不同帧率/速度下一致性
-    const double dt_ticks = ecosystem_state.get_delta_ticks();
-    current_step_distance = step_distance_per_tick * dt_ticks;
+    // 每 tick 执行 HP 恢复
+    apply_hp_regen(ecosystem_state);
 
-    const int world_width = ecosystem_state.config.world_width;
-    const int world_height = ecosystem_state.config.world_height;
-
-    switch (pending_move_mode) {
-        case PendingMoveMode::Path:
-            move_to_target_point(world_width, world_height);
-            break;
-        case PendingMoveMode::Wander:
-            if (wander_target.has_value()) {
-                const Position target = wander_target.value();
-                move_towards_target(target, world_width, world_height);
-                // 平滑到达阈值：避免门槛效应导致抖动
-                const double arrival_threshold = std::max(1.0, current_step_distance * 0.5);
-                if (position.distance_to(target) <= arrival_threshold) {
-                    wander_target.reset();
-                }
-            }
-            break;
-        case PendingMoveMode::None:
-        default:
-            break;
+    // 当使用行为树时，移动与消耗由 BT Action 执行；此处不再运行旧移动分支
+    if (use_bt) {
+        return;
     }
 
-    pending_move_mode = PendingMoveMode::None;
-
+    // 非 BT 路径：不再包含旧的 Path/Wander 移动逻辑，仅处理基础能量结算
     energy -= energy_consumption;
-    if (energy <= 0.0) {
-        die_from_starvation();
+    if (energy < 0.0) energy = 0.0; // 统一：不直接死亡，改由饥饿伤害扣 HP
+}
+
+// 根据当前饥饿状态恢复生命
+void Animal::apply_hp_regen(const EcosystemState& ecosystem_state) {
+    update_hunger_state();
+    const int tpd = std::max(1, ecosystem_state.config.ticks_per_day);
+    const double base_per_tick = hp_regen_base_per_day / static_cast<double>(tpd);
+    double hunger_mul = 0.0;
+    switch (hunger_state) {
+        // 满足：快速恢复
+        case HungerState::SATISFIED: hunger_mul = hp_regen_mul_satisfied; break;
+        // 正常：基础值
+        case HungerState::NORMAL:    hunger_mul = hp_regen_mul_normal; break;
+        // 饥饿：恢复缓慢
+        case HungerState::STARVING:  hunger_mul = hp_regen_mul_starving; break;
+        default: hunger_mul = 0.0; break;
+    }
+    // 根据比例计算触发间隔的 tick 数（至少为 1）
+    const int interval_ticks = std::max(1, static_cast<int>(std::floor(std::max(0.0, regan_interval_ratio) * static_cast<double>(tpd))));
+    // 自增计时器；当达到间隔后批量结算该段累计的恢复量
+    ticks_since_last_regen++;
+    if (ticks_since_last_regen < interval_ticks) {
+        return;
+    }
+    // 批量恢复：保持每日期望不变（按间隔汇总 base_per_tick * ticks）
+    const double regen_amount = base_per_tick * hunger_mul * static_cast<double>(ticks_since_last_regen);
+    ticks_since_last_regen = 0;
+    if (regen_amount > 0.0 && hp_current < hp_max) {
+        hp_current = std::min(hp_max, hp_current + regen_amount);
+        SPDLOG_LOGGER_DEBUG(spdlog::get("ecosim"),
+            "[HP Regen] '{}' +{:.3f} (tpd={}, interval_ticks={}, base/day={:.2f}, hunger_mul={:.2f})",
+            species_name, regen_amount, tpd, interval_ticks, hp_regen_base_per_day, hunger_mul);
     }
 }
 
@@ -334,31 +174,37 @@ void Animal::update_hunger_state() {
     }
 }
 
-void Animal::adjust_stats_by_state() {
-    switch (hunger_state) {
-        case HungerState::SATISFIED:
-            is_wandering = true;
-            wandering_cooldown = 100; // Example value, should be configurable
-            movement_speed = base_movement_speed * 0.2;
-            energy_consumption = base_energy_consumption * 0.5;
-            break;
-        case HungerState::STARVING:
-            is_wandering = false;
-            movement_speed = base_movement_speed * 0.4;
-            energy_consumption = base_energy_consumption * 0.1;
-            break;
-        case HungerState::NORMAL:
-        default:
-            if (wandering_cooldown > 0) {
-                wandering_cooldown--;
-            } else {
-                is_wandering = false;
-            }
-            movement_speed = base_movement_speed * 1.0;
-            energy_consumption = base_energy_consumption * 1.0;
-            break;
-    }
+// ---- 新增：公共访问接口实现（供行为树使用） ----
+HungerState Animal::get_hunger_state() const { return hunger_state; }
+void Animal::refresh_hunger_state() { update_hunger_state(); }
+double Animal::get_mating_range() const { return mating_range; }
+double Animal::get_wander_radius() const { return wander_radius; }
+double Animal::get_mating_desire_probability() const { return mating_desire_probability; }
+double Animal::get_detection_range() const { return detection_range; }
+double Animal::get_pregnancy_speed_penalty() const { return pregnancy_speed_penalty; }
+bool Animal::get_skip_movement() const { return skip_movement; }
+void Animal::set_skip_movement(bool v) { skip_movement = v; }
+void Animal::clear_sensor_caches() {
+    cached_food_races.clear();
+    cached_mates.clear();
 }
+void Animal::cache_mate(const std::shared_ptr<Animal>& mate) { cached_mates.emplace_back(mate); }
+void Animal::cache_food_race(const std::shared_ptr<RaceBase>& race) { cached_food_races.emplace_back(race); }
+std::vector<std::weak_ptr<Animal>> Animal::get_cached_mates_snapshot() const { return cached_mates; }
+std::vector<std::weak_ptr<RaceBase>> Animal::get_cached_food_races_snapshot() const { return cached_food_races; }
+void Animal::set_current_target(const std::optional<Position>& p) { current_target = p; }
+std::optional<Position> Animal::get_current_target() const { return current_target; }
+void Animal::clear_current_target() { current_target.reset(); }
+void Animal::set_mating_target(const std::optional<Position>& p) { mating_target = p; }
+std::optional<Position> Animal::get_mating_target() const { return mating_target; }
+void Animal::clear_mating_target() { mating_target.reset(); }
+void Animal::set_wander_target(const std::optional<Position>& p) { wander_target = p; }
+std::optional<Position> Animal::get_wander_target() const { return wander_target; }
+void Animal::clear_wander_target() { wander_target.reset(); }
+void Animal::clear_path() { planned_path.clear(); planned_path_index = 0; }
+double Animal::get_current_step_distance() const { return current_step_distance; }
+double Animal::get_step_distance_per_tick() const { return step_distance_per_tick; }
+
 
 double Animal::get_hunting_desire() const {
     switch (hunger_state) {
@@ -372,44 +218,7 @@ double Animal::get_hunting_desire() const {
     }
 }
 
-std::optional<Position> Animal::find_nearest_food(const EcosystemState& ecosystem_state) {
-    // 寻找最近的食物源
-    std::optional<Position> nearest_food;
-    double min_distance = std::numeric_limits<double>::max();
-    const EcosystemStateData snapshot = ecosystem_state.get_ecosystem_state();
-
-    for (const auto& food_type : food_types) {
-        const auto race_it = snapshot.race_lists.find(food_type);
-        if (race_it != snapshot.race_lists.end()) {
-            for (const auto& food : race_it->second) {
-                if (food && food->alive) {
-                    double distance = position.distance_to(food->position);
-                    if (distance <= detection_range && distance < min_distance) {
-                        min_distance = distance;
-                        nearest_food = food->position;
-                    }
-                }
-            }
-            continue;
-        }
-
-        const auto thing_it = snapshot.thing_lists.find(food_type);
-        if (thing_it == snapshot.thing_lists.end()) {
-            continue;
-        }
-
-        for (const auto& food : thing_it->second) {
-            if (food && food->alive) {
-                double distance = position.distance_to(food->position);
-                if (distance <= detection_range && distance < min_distance) {
-                    min_distance = distance;
-                    nearest_food = food->position;
-                }
-            }
-        }
-    }
-    return nearest_food;
-}
+// 已移除：find_nearest_food（简化为行为树目标选择）
 
 void Animal::move_towards_target(const Position& target_position, int world_width, int world_height) {
     // 朝目标位置移动
@@ -420,9 +229,10 @@ void Animal::move_towards_target(const Position& target_position, int world_widt
 
     if (distance > 0) {
         // 到达减速（Arrive）：临近目标时按比例减速，平滑收敛
-    const double slow_radius = std::max(current_step_distance * 8.0, step_distance_per_tick * 4.0);
-    const double ratio = std::min(1.0, distance / std::max(1e-9, slow_radius));
-    const double desired = current_step_distance * ratio;
+        // 优化：缩小减速半径，避免过早减速导致“靠近非常慢”的体验
+        const double slow_radius = std::max(current_step_distance * 2.0, step_distance_per_tick * 1.0);
+        const double ratio = std::min(1.0, distance / std::max(1e-9, slow_radius));
+        const double desired = current_step_distance * ratio;
         const double step = std::min(desired, distance);
         dx = (dx / distance) * step;
         dy = (dy / distance) * step;
@@ -432,81 +242,8 @@ void Animal::move_towards_target(const Position& target_position, int world_widt
     }
 }
 
-void Animal::intelligent_move(const EcosystemState& ecosystem_state) {
-    // 智能移动 - 分离为目标选择与移动执行
-    if (!alive) return;
-    if (hunting_cooldown > 0) {
-        hunting_cooldown -= 1;
-        return;
-    }
+// 已移除：intelligent_move（简化为行为树驱动的移动）
 
-    // 先选择目标点（可能为空）
-    select_target_point(ecosystem_state);
-
-    int world_width = ecosystem_state.config.world_width;
-    int world_height = ecosystem_state.config.world_height;
-
-    // 基于tick缩放本次移动距离（智能移动路径）
-    const double dt_ticks2 = ecosystem_state.get_delta_ticks();
-    current_step_distance = step_distance_per_tick * dt_ticks2;
-
-    if (current_target.has_value()) {
-        // 为目标规划路径（占位，未来可替换为 A*）
-        plan_path_to_target(ecosystem_state,current_target);
-        // 执行沿路径移动一步
-        move_to_target_point(world_width, world_height);
-    } else {
-        // 无目标时采用随机游走
-    auto& rng = const_cast<EcosystemState&>(ecosystem_state).get_thread_local_rng();
-    move_randomly(world_width, world_height, current_step_distance, rng);
-    }
-}
-
-void Animal::select_target_point(const EcosystemState& ecosystem_state) {
-    // 选择当前目标点：在探测范围内寻找最近的食物
-    // 吃饱状态下不主动找食物，改为散步
-    if (hunger_state == HungerState::SATISFIED) {
-        current_target.reset();
-        planned_path.clear();
-        planned_path_index = 0;
-        return;
-    }
-    std::optional<Position> nearest_food;
-    double min_distance = std::numeric_limits<double>::max();
-
-    const auto nearby_races = ecosystem_state.get_nearby_races_broad(position, detection_range);
-    const auto nearby_things = ecosystem_state.get_nearby_things_broad(position, detection_range);
-
-    const auto consider_entity = [&](const auto& entity) {
-        if (!entity || !entity->alive) {
-            return;
-        }
-        if (std::find(food_types.begin(), food_types.end(), entity->species_name) == food_types.end()) {
-            return;
-        }
-
-        double distance = position.distance_to(entity->position);
-        if (distance <= detection_range && distance < min_distance) {
-            min_distance = distance;
-            nearest_food = entity->position;
-        }
-    };
-
-    for (const auto& race : nearby_races) {
-        consider_entity(race);
-    }
-    for (const auto& thing : nearby_things) {
-        consider_entity(thing);
-    }
-
-    if (nearest_food.has_value()) {
-        current_target = nearest_food.value();
-    } else {
-        current_target.reset();
-        planned_path.clear();
-        planned_path_index = 0;
-    }
-}
 
 void Animal::plan_path_to_target(const EcosystemState& ecosystem_state, const std::optional<Position>& target) {
     if (!target.has_value()) return;
@@ -530,18 +267,18 @@ void Animal::move_to_target_point(int world_width, int world_height) {
 
     // 达到当前路径点后推进到下一个点
     double remain = position.distance_to(goal);
-    const double arrival_threshold = std::max(1.0, current_step_distance * 0.5);
+    const double arrival_threshold = std::max(0.2, current_step_distance * 0.5);
     if (remain <= arrival_threshold) {
         if (!planned_path.empty() && planned_path_index < planned_path.size()) {
             planned_path_index += 1;
             if (planned_path_index >= planned_path.size()) {
-                // 路径完成
+                // 路径完成：保留 current_target，交由上层行为（如 EatNearbyThing）处理近场交互
                 planned_path.clear();
                 planned_path_index = 0;
             }
         } else {
-            // 直接目标已到达（近似判断），清空目标以触发重新选择
-            current_target.reset();
+            // 直接目标已到达：不再主动清空 current_target，避免“到达-清空-重选-再移动”的停顿感
+            // 保持目标以便上层优先选择器首先尝试近场动作（吃草/交互），从而平滑收敛
         }
     }
 }
@@ -553,8 +290,8 @@ void Animal::start_hunting_cooldown() {
 
 bool Animal::can_reproduce() const {
     if (sex == Sex::MALE) {
-        // 雄性检查自身状态（能量、年龄、冷却）
-        return RaceBase::can_reproduce() && age > min_reproduction_age;
+        // 雄性检查自身状态（能量、年龄、冷却）；若正在交配则不可重复触发
+        return (mating_timer <= 0) && RaceBase::can_reproduce() && age > min_reproduction_age;
     }
     if (sex == Sex::FEMALE) {
         // 雌性检查是否“可受孕”
@@ -582,7 +319,6 @@ void Animal::become_pregnant() {
     if (sex == Sex::FEMALE) {
         is_pregnant = true;
         pregnancy_timer = pregnancy_duration;
-        start_reproduction_cooldown();
     }
 }
 
@@ -605,38 +341,159 @@ std::optional<std::shared_ptr<Animal>> Animal::find_available_mate(const Ecosyst
     return nearest_mate;
 }
 void Animal::build_behavior_tree() {
-    using namespace bt;
-    // 根：优先级选择器（高优先级在前）
-    auto root = std::make_shared<PrioritySelector>();
+    // 通过独立模块构建行为树，保持 Animal 仅承载数据与生命周期
+    behavior_tree = behavior::build_tree_for_animal(*this);
+    if (behavior_tree) {
+        auto& bb = behavior_tree->blackboard();
+        const std::string source = (bb.strings.find("bt_source") != bb.strings.end()) ? bb.strings.at("bt_source") : std::string("unknown");
+        SPDLOG_LOGGER_INFO(spdlog::get("ecosim"), "[BT] Loaded tree for '{}' from {}", species_name, source);
+    } else {
+        SPDLOG_LOGGER_ERROR(spdlog::get("ecosim"), "[BT] Failed to build behavior tree for '{}'", species_name);
+    }
+}
 
-    // 交配序列：条件 -> 追配偶/提交交互（占位行动）
-    auto seq_mate = std::make_shared<Sequence>();
-    seq_mate->add_child(std::make_shared<Condition>([this](TickContext&){
-        return sex == Sex::MALE && can_reproduce();
-    }));
-    seq_mate->add_child(std::make_shared<Action>([this](TickContext&){
-        // 占位：在完整迁移时将调用寻找配偶与路径规划
-        // 目前返回 Running 以表示此分支可持续执行
-        return Status::Running;
-    }));
+void Animal::apply_bt_params_to_blackboard(const AnimalParams& params) {
+    if (!behavior_tree) return;
+    auto& bb = behavior_tree->blackboard();
+    // 注入整数参数
+    for (const auto& kv : params.bt_params_ints) {
+        bb.ints[kv.first] = kv.second;
+    }
+    // 注入浮点参数
+    for (const auto& kv : params.bt_params_doubles) {
+        bb.doubles[kv.first] = kv.second;
+    }
+    // 确保攻击伤害存在于黑板（若 YAML 未提供，则使用物种默认值）
+    if (bb.doubles.find("attack_damage") == bb.doubles.end()) {
+        bb.doubles["attack_damage"] = params.attack_damage;
+    }
+    // 注入字符串参数
+    for (const auto& kv : params.bt_params_strings) {
+        bb.strings[kv.first] = kv.second;
+    }
 
-    // 觅食/捕食序列：条件 -> 搜索/进食（占位行动）
-    auto seq_forage = std::make_shared<Sequence>();
-    seq_forage->add_child(std::make_shared<Condition>([this](TickContext&){
-        return hunger_state != HungerState::SATISFIED && !food_types.empty();
-    }));
-    seq_forage->add_child(std::make_shared<Action>([this](TickContext&){
-        return Status::Running;
-    }));
+    // 饥饿伤害参数（若 YAML 未在 bt_params 指定，则回退到 species 默认值）
+    if (bb.doubles.find("starvation_damage") == bb.doubles.end()) {
+        bb.doubles["starvation_damage"] = std::max(0.0, params.starvation_damage);
+    }
+    if (bb.doubles.find("starvation_damage_interval_ratio") == bb.doubles.end()) {
+        bb.doubles["starvation_damage_interval_ratio"] = std::max(0.0, std::min(1.0, params.starvation_damage_interval_ratio));
+    }
 
-    // 游荡行为：无条件行动（占位）
-    auto act_wander = std::make_shared<Action>([this](TickContext&){
-        return Status::Running;
-    });
+    // 注入游荡总时长到黑板，供进度装饰器读取（若 YAML 未提供则使用 species_params 默认值）
+    if (params.wandering_duration > 0) {
+        bb.ints["wander_total_ticks"] = params.wandering_duration;
+    }
+    // 初始化游荡当前进度为 0，确保首次可见且不受之前残留影响
+    if (bb.ints.find("wander_current_ticks") == bb.ints.end()) {
+        bb.ints["wander_current_ticks"] = 0;
+    }
 
-    root->add_child(seq_mate);
-    root->add_child(seq_forage);
-    root->add_child(act_wander);
+    // 追草多步推进的默认值（未在 YAML 指定时），缓解“逐帧小步·放大似瞬移”问题
+    if (bb.ints.find("chase_substeps_per_tick") == bb.ints.end()) {
+        bb.ints["chase_substeps_per_tick"] = 3; // 默认每 tick 连续推进 3 步
+    }
 
-    behavior_tree = std::make_unique<BehaviorTree>(root);
+    // 打印调试信息：eat_grass_total_ticks 来源与当前黑板值
+    {
+        int eat_total = -1;
+        auto it = bb.ints.find("eat_grass_total_ticks");
+        if (it != bb.ints.end()) eat_total = it->second;
+        SPDLOG_LOGGER_INFO(spdlog::get("ecosim"),
+            "[BT Params] '{}' eat_grass_total_ticks={} (after injection)",
+            species_name, eat_total);
+        // 初始化吃草当前进度键，便于进度装饰器与日志显示
+        if (bb.ints.find("eat_grass_current_ticks") == bb.ints.end()) {
+            bb.ints["eat_grass_current_ticks"] = 0;
+        }
+    }
+}
+
+// --- 统一能量与一步移动封装（供行为树动作复用） ---
+void Animal::consume_energy(double multiplier) {
+    const double m = std::max(0.0, multiplier);
+    energy -= (static_cast<double>(energy_consumption) * m);
+    // 统一生命机制：能量耗尽不直接死亡，改由行为树 Update 里的饥饿伤害扣 HP
+    if (energy < 0.0) energy = 0.0;
+}
+
+double Animal::get_nutrition_value() const {
+    return std::max(0.0, nutrition_value);
+}
+
+// 通用一步移动 + 能量结算内核：由调用者提供具体推进实现
+void Animal::perform_step_move_common(double speed_multiplier, double energy_multiplier,
+                                      const char* log_tag,
+                                      const std::function<void()>& advance_fn) {
+    const double prev_x = position.x;
+    const double prev_y = position.y;
+    current_step_distance = step_distance_per_tick * std::max(0.0, speed_multiplier);
+    advance_fn();
+    const double moved_dx = std::abs(position.x - prev_x);
+    const double moved_dy = std::abs(position.y - prev_y);
+    {
+        const double moved_len = std::sqrt(moved_dx * moved_dx + moved_dy * moved_dy);
+        SPDLOG_LOGGER_DEBUG(spdlog::get("ecosim"),
+            "[MoveStep->{}] '{}' step={:.2f} moved={:.2f} prev=({:.1f},{:.1f}) now=({:.1f},{:.1f}) mul(speed={:.2f}, energy={:.2f})",
+            log_tag,
+            species_name,
+            current_step_distance,
+            moved_len,
+            prev_x, prev_y,
+            position.x, position.y,
+            std::max(0.0, speed_multiplier), std::max(0.0, energy_multiplier));
+    }
+    if (moved_dx > 1e-9 || moved_dy > 1e-9) {
+        consume_energy(energy_multiplier);
+    }
+}
+
+void Animal::perform_step_move_to(const Position& target, int world_width, int world_height,
+                                  double speed_multiplier, double energy_multiplier) {
+    perform_step_move_common(speed_multiplier, energy_multiplier, "To",
+        [this, target, world_width, world_height]() {
+            move_towards_target(target, world_width, world_height);
+        }
+    );
+}
+
+#ifdef ECOSIM_ENABLE_UI_DEBUG
+
+void Animal::update_ui_snapshot(const AnimalUiSnapshot& snapshot) {
+    std::lock_guard<std::mutex> lock(m_ui_snapshot_mutex);
+    auto history = std::move(m_ui_snapshot.interaction_history);
+    m_ui_snapshot = snapshot;
+    m_ui_snapshot.interaction_history = std::move(history);
+}
+
+AnimalUiSnapshot Animal::get_ui_snapshot() const {
+    std::lock_guard<std::mutex> lock(m_ui_snapshot_mutex);
+    return m_ui_snapshot;
+}
+
+void Animal::add_interaction_log(const std::string& message, bool success, int timestamp) {
+    std::lock_guard<std::mutex> lock(m_ui_snapshot_mutex);
+
+    constexpr std::size_t kMaxHistorySize = 50;
+
+    m_ui_snapshot.interaction_history.push_back({timestamp, message, success});
+
+    if (m_ui_snapshot.interaction_history.size() > kMaxHistorySize) {
+        const auto overflow = m_ui_snapshot.interaction_history.size() - kMaxHistorySize;
+        m_ui_snapshot.interaction_history.erase(
+            m_ui_snapshot.interaction_history.begin(),
+            m_ui_snapshot.interaction_history.begin() + overflow
+        );
+    }
+}
+
+#endif
+
+void Animal::perform_step_move_path(int world_width, int world_height,
+                                    double speed_multiplier, double energy_multiplier) {
+    perform_step_move_common(speed_multiplier, energy_multiplier, "Path",
+        [this, world_width, world_height]() {
+            move_to_target_point(world_width, world_height);
+        }
+    );
 }

@@ -33,13 +33,16 @@ struct EcosystemStateData {
     std::map<std::string, std::vector<std::shared_ptr<RaceBase>>> race_lists;
     std::map<std::string, std::vector<std::shared_ptr<ThingBase>>> thing_lists;
     int time_step;
-    double delta_ticks; // 本次更新推进的tick数量（可为小数）
     int current_day;
     int current_quadrum;
     int current_year;
+    int current_hour;
+    int current_minute;
     std::string current_quadrum_name;
     Eigen::MatrixXd grass_positions_array; // 对应Python中的numpy数组
     std::vector<std::shared_ptr<ThingBase>> alive_grass_objects;
+    // 新增：后端模拟TPS（每秒tick数）
+    double current_tps;
 };
 
 #endif // UTILS_H
