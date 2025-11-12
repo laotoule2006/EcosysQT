@@ -36,7 +36,9 @@ find_package(spdlog CONFIG REQUIRED)
 include_directories(
     ${CMAKE_SOURCE_DIR}/backend/include
     ${CMAKE_SOURCE_DIR}/src/ui
-)# --- 添加源文件 ---
+)
+
+# --- 添加源文件 ---
 # 定义可执行文件及其源文件
 add_executable(MyQtApp
   main.cpp
@@ -53,8 +55,8 @@ add_executable(MyQtApp
   src/ui/Widget.cpp
   src/ui/Widget.h
   # 资源文件（AUTORCC）
-  
-  resources/app.qrc)
+  resources/app.qrc
+)
 
 # --- 链接库 ---
 # 将你的可执行文件与所需库链接起来
@@ -65,5 +67,5 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     Eigen3::Eigen
     nlohmann_json::nlohmann_json
     spdlog::spdlog
-    yaml-cpp
+    yaml-cpp::yaml-cpp # <-- 修改完成！
 )
